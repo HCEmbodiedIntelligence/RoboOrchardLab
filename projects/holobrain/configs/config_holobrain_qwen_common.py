@@ -25,7 +25,7 @@ config = dict(
     min_depth=0.01,
     max_depth=1.2,
     num_depth=128,
-    batch_size=16,
+    batch_size=1,
     max_step=int(1e5),
     step_log_freq=50,
     save_step_freq=5000,
@@ -35,17 +35,15 @@ config = dict(
     with_cot=False,
     training_datasets=[
         "robotwin2_0",
-        "robotwin2_0_ur5_wsg",
     ],
     # validation_datasets=["robotwin2_0"],
     deploy_datasets=[
         "robotwin2_0",
-        "robotwin2_0_ur5_wsg",
     ],
-    vlm_pretrain="Qwen/Qwen2.5-VL-3B-Instruct",
+    vlm_pretrain="/data/weights/Qwen/Qwen2.5-VL-3B-Instruct",
     num_vlm_layers=1,
-    freeze_vlm=False,
-    checkpoint="hf://model/HorizonRobotics/HoloBrain_v0.0_Qwen/pretrain/model.safetensors",  # noqa: E501
+    freeze_vlm=True,
+    checkpoint="/data/weights/HorizonRobotics/HoloBrain_v0.0_Qwen/pretrain/model.safetensors",  # noqa: E501
 )
 
 

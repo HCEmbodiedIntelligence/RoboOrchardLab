@@ -66,6 +66,11 @@ class MyBatchProcessor(SimpleStepProcessor):
         super().__init__(*args, **kwargs)
 
     def forward(self, model, batch):
+        # dict_keys(['uuid', 'imgs', 'depths',
+        # 'text', 'state_loss_weights', 'fk_loss_weight',
+        # 'joint_mask', 'image_wh', 'projection_mat',
+        # 'embodiedment_mat', 'joint_scale_shift', 'pred_robot_state',
+        # 'hist_robot_state', 'kinematics'])
         output = model(batch)
         loss = sum([y.mean() for x, y in output.items() if "loss" in x])
         return output, loss
@@ -108,9 +113,17 @@ def main(args, accelerator):
 
     model = build_model(config)
 
-    num_workers = config.get("num_workers", 4)
+    #DEBUG:
+    # num_workers = config.get("num_workers", 4)
+    num_workers = 0
     if not args.eval_only:
+        #NOTE: dataset keys:
+        #['uuid', 'imgs', 'depths', 'text', 'state_loss_weights',
+        # 'fk_loss_weight', 'joint_mask', 'image_wh', 'projection_mat',
+        # 'embodiedment_mat', 'joint_scale_shift', 'pred_robot_state',
+        # 'hist_robot_state', 'kinematics'])
         train_dataset = build_dataset(config)
+
         train_dataloader = torch.utils.data.DataLoader(
             train_dataset,
             num_workers=num_workers,

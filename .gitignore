@@ -1,3 +1,9 @@
+hc_assets/
+own_test/
+workspace/
+projects/holobrain/own_test
+.worktreeinclude
+.agents/
 ##log
 test_logs_worker_master.log
 

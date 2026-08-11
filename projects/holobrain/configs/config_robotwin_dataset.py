@@ -32,8 +32,7 @@ dataset_config = dict(
             [0, 0, 0, 1],
         ],
         paths=[
-            "./data/robotwin2.0/aloha_agilex_demo_clean",
-            "./data/robotwin2.0/aloha_agilex_demo_randomized",
+            "/data/tmp/robotwin_test",
         ],
         scale_shift=[
             [1.12735104, -0.11648428],

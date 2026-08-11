@@ -268,6 +268,7 @@ if __name__ == "__main__":
             "flask",
             "gevent",
             "imageio[ffmpeg]",
+            "rosbags>=0.11,<0.12",
         ],
         "mcap_datasets": [
             "mcap-protobuf-support>=0.5.3",

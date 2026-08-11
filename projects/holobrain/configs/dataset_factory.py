@@ -53,6 +53,7 @@ def apply_dataset_register():
         return
     import config_agibot_geniesim_dataset  # noqa: F401
     import config_agilex_ro_dataset  # noqa: F401
+    import config_hc_tj_ro_dataset  # noqa: F401
     import config_robotwin_dataset  # noqa: F401
 
     REGISTERED = True

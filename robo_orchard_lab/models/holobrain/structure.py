@@ -185,6 +185,11 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
     def forward(self, inputs):
         if self.data_preprocessor is not None:
             device = next(self.parameters()).device
+            # dict_keys(['uuid', 'imgs', 'depths', 'text',
+            # 'state_loss_weights', 'fk_loss_weight', 'joint_mask',
+            # 'image_wh', 'projection_mat', 'embodiedment_mat',
+            # 'joint_scale_shift', 'pred_robot_state', 'hist_robot_state',
+            # 'kinematics', 'origin_imgs', 'img_mean', 'img_std', 'depth_prob_gt', 'instruction'])
             inputs = self.data_preprocessor(inputs, device)
         if self.training:
             return self.loss(inputs)
@@ -250,6 +255,7 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
         return x
 
     def _vlm_outputs_handler(self, vlm_outputs, vlm_inputs, inputs):
+        """将 VLM 的统一 token 序列表示,按 token 类型拆回“有空间结构的视觉特征”和“带有效位标记的语言特征”,供 spatial_enhancer 与 decoder 使用."""  # noqa: E501
         if self.with_cot:
             assert "sequences" in vlm_outputs
             vlm_input_ids = vlm_outputs.sequences[:, :-1]
@@ -304,10 +310,14 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
         )
         vlm_inputs = vlm_inputs.to(device)
         if not self.with_cot:
+            # 单次前向
             vlm_outputs = self._forward_vlm(**vlm_inputs)
         else:
+            # 自回归生成256个token
             vlm_outputs = self._generate_vlm(vlm_inputs)
 
+        # feature_maps:(B, cam_num, D, Gh, Gw)
+        # text_dict: {"embedded": text_feature, # (B, text_token_len, D),"text_token_mask": text_feature_mask, # (B, text_token_len), bool}
         feature_maps, text_dict = self._vlm_outputs_handler(
             vlm_outputs, vlm_inputs, inputs
         )
@@ -341,6 +351,14 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
         pixel_values=None,
         image_grid_thw=None,
     ):
+        """将 input_ids 转成文本 embedding, 并调用 VLM 前向.
+
+        1. 将 input_ids 转成文本 embedding;
+        2. 用视觉编码器提取 image_embeds;
+        3. 将 prompt 中 image_token 对应位置替换为图像特征;
+        4. 计算多模态 RoPE 的 position_ids;
+        5. 调用 self.vlm.language_model(...) 一次,要求返回所有层隐藏状态.
+        """
         inputs_embeds = self.vlm.language_model.embed_tokens(input_ids)
         if pixel_values is not None:
             pixel_values = pixel_values.type(self.vlm.visual.dtype)
