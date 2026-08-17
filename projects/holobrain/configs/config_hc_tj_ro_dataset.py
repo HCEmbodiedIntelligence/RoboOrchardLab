@@ -126,6 +126,34 @@ def _expand_ro_data_paths(patterns: list[str]) -> list[str]:
     return sorted(set(paths))
 
 
+def _select_episodes(dataset, episode_indices: list[int]):
+    """Return a frame subset containing complete selected episodes."""
+    from torch.utils.data import Subset
+
+    selected_frames: list[int] = []
+    seen: set[int] = set()
+    for episode_index in episode_indices:
+        if isinstance(episode_index, bool) or not isinstance(
+            episode_index, int
+        ):
+            raise TypeError("validation_episode_indices must contain integers")
+        if episode_index in seen:
+            raise ValueError(
+                f"Duplicate validation episode index: {episode_index}"
+            )
+        if episode_index < 0 or episode_index >= dataset.num_episode:
+            raise ValueError(
+                f"Validation episode index {episode_index} is outside "
+                f"[0, {dataset.num_episode})"
+            )
+        seen.add(episode_index)
+        start, stop = dataset.get_episode_range(episode_index)
+        selected_frames.extend(range(start, stop))
+    if not selected_frames:
+        raise ValueError("validation_episode_indices must not be empty")
+    return Subset(dataset, selected_frames)
+
+
 def build_transforms(config, mode, data_config):
     """Build hc_tj transforms with all geometry expressed in zhi_Link."""
     import numpy as np
@@ -313,6 +341,12 @@ def build_datasets(config, dataset_names, mode, **kwargs):
             pred_steps=config["pred_steps"],
             transforms=[build(item) for item in as_sequence(transforms)],
         )
+        if (
+            mode == "validation"
+            and (episode_indices := config.get("validation_episode_indices"))
+            is not None
+        ):
+            dataset = _select_episodes(dataset, episode_indices)
         dataset.flag = int(
             uuid.uuid5(uuid.NAMESPACE_DNS, dataset_name).hex[:4], 16
         )

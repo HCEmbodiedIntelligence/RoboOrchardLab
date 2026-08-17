@@ -171,7 +171,11 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
         self, directory: str, model_prefix: str = "model", **kwargs
     ):
         super().save_model(directory, model_prefix, **kwargs)
-        directory = os.path.join(directory, self.cfg.vlm_pretrain)
+        if os.path.isdir(self.cfg.vlm_pretrain):
+            vlm_pretrain = os.path.basename(self.cfg.vlm_pretrain)
+        else:
+            vlm_pretrain = self.cfg.vlm_pretrain
+        directory = os.path.join(directory, vlm_pretrain)
         if self.cfg.save_model_with_vlm:
             if not os.path.exists(directory):
                 os.makedirs(directory)

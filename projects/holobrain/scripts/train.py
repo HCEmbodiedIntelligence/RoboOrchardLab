@@ -76,6 +76,28 @@ class MyBatchProcessor(SimpleStepProcessor):
         return output, loss
 
 
+@torch.no_grad()
+def evaluate(model, val_dataloader, metric, accelerator):
+    """Run validation without constructing a training-only trainer."""
+    training = model.training
+    model.eval()
+    torch.cuda.empty_cache()
+    if accelerator.is_main_process:
+        logger.info("\n" + "=" * 50 + "BEGIN EVAL" + "=" * 50)
+    for val_step_id, batch in enumerate(val_dataloader):
+        model_outputs = model(batch)
+        metric.update(batch, model_outputs)
+        if (val_step_id + 1) % 10 == 0 and accelerator.is_main_process:
+            logger.info(f"eval: {val_step_id + 1}")
+    accelerator.wait_for_everyone()
+    result = metric.compute(accelerator=accelerator)
+    accelerator.wait_for_everyone()
+    metric.reset()
+    torch.cuda.empty_cache()
+    model.train(training)
+    return result
+
+
 def main(args, accelerator):
     if_cluster = os.environ.get("CLUSTER") is not None
     if accelerator.is_main_process:
@@ -177,11 +199,20 @@ def main(args, accelerator):
         val_dataloader = None
         metric = None
 
+    if args.eval_only:
+        if val_dataloader is None or metric is None:
+            raise ValueError(
+                "The validation dataset must be specified when eval_only=True."
+            )
+        model, val_dataloader = accelerator.prepare(model, val_dataloader)
+        evaluate(model, val_dataloader, metric, accelerator)
+        return
+
     trainer = SimpleTrainer(
         model=model,
-        dataloader=train_dataloader,
-        optimizer=optimizer,
-        lr_scheduler=lr_scheduler,
+        dataloader=train_dataloader, # pyright: ignore
+        optimizer=optimizer,# pyright: ignore
+        lr_scheduler=lr_scheduler,# pyright: ignore
         accelerator=accelerator,
         grad_clip_mode="norm",
         grad_max_norm=10,
@@ -209,13 +240,7 @@ def main(args, accelerator):
         val_dataloader=val_dataloader,
         metric=metric,
     )
-    if args.eval_only:
-        assert val_dataset is not None, (
-            "The validation dataset must be specified when eval_only=True."
-        )
-        trainer.eval()
-    else:
-        trainer()
+    trainer()
 
 
 if __name__ == "__main__":

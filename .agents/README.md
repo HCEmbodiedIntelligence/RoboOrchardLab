@@ -6,11 +6,9 @@ agent-facing assets for `robo_orchard_lab`.
 ## Local Assets
 
 - `instructions/`: repository-local guidance and workflow entrypoints.
-- `references/`: stable agent-facing reference guidance and decision
-  summaries.
+- `references/`: stable agent-facing reference guidance and decision summaries.
 - `skills/`: task-specific local workflows.
-- `templates/`: reusable fill-in skeletons for repeated implementation,
-  design, and documentation work.
+- `templates/`: reusable fill-in skeletons for repeated implementation,design, and documentation work.
 
 Use `AGENTS.md` for routing and precedence. Keep durable rules in
 `references/`, workflow expectations in `instructions/`, and repeated output

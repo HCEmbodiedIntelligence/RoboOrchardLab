@@ -173,10 +173,55 @@ def _scan_complete_mcap_records(data: bytes) -> tuple[int, int, int]:
     return offset, records, chunks
 
 
+def _scan_complete_mcap_file(source_path: Path) -> tuple[int, int, int, bool]:
+    """Scan top-level MCAP record boundaries without loading the file."""
+    source_size = source_path.stat().st_size
+    with source_path.open("rb") as source:
+        if source.read(len(MCAP_MAGIC)) != MCAP_MAGIC:
+            raise ValueError(
+                "Input is not an MCAP file: leading magic is invalid"
+            )
+        if source_size >= len(MCAP_MAGIC):
+            source.seek(source_size - len(MCAP_MAGIC))
+            normally_closed = source.read(len(MCAP_MAGIC)) == MCAP_MAGIC
+        else:
+            normally_closed = False
+
+        offset = len(MCAP_MAGIC)
+        records = 0
+        chunks = 0
+        while offset + 9 <= source_size:
+            source.seek(offset)
+            header = source.read(9)
+            if header[: len(MCAP_MAGIC)] == MCAP_MAGIC:
+                break
+            record_size = struct.unpack_from("<Q", header, 1)[0]
+            record_end = offset + 9 + record_size
+            if record_end > source_size:
+                break
+            records += 1
+            chunks += header[0] == 0x06
+            offset = record_end
+    return offset, records, chunks, normally_closed
+
+
+def _copy_prefix(source_path: Path, destination: Path, size: int) -> None:
+    """Copy exactly ``size`` bytes for a recovered MCAP prefix."""
+    remaining = size
+    with source_path.open("rb") as source, destination.open("wb") as target:
+        while remaining:
+            block = source.read(min(8 * 1024 * 1024, remaining))
+            if not block:
+                raise OSError(f"Unexpected EOF while recovering {source_path}")
+            target.write(block)
+            remaining -= len(block)
+        target.write(MCAP_DATA_END + MCAP_EMPTY_FOOTER + MCAP_MAGIC)
+
+
 @contextmanager
 def _readable_mcap_path(
     source_path: Path, recover_truncated: bool
-) -> Iterator[tuple[Path, _RecoveryInfo]]:
+) -> Generator[tuple[Path, _RecoveryInfo], None, None]:
     """Yield a readable MCAP path without modifying the source file.
 
     A normally closed MCAP is yielded directly. An unclosed or truncated MCAP
@@ -184,16 +229,16 @@ def _readable_mcap_path(
     copied, followed by a minimal DataEnd/Footer/trailing-magic sequence. The
     temporary copy is deleted when the context exits, including on errors.
     """
-    data = source_path.read_bytes()
-    recovery_offset, complete_records, complete_chunks = (
-        _scan_complete_mcap_records(data)
+    source_size = source_path.stat().st_size
+    recovery_offset, complete_records, complete_chunks, normally_closed = (
+        _scan_complete_mcap_file(source_path)
     )
-    if data.endswith(MCAP_MAGIC):
+    if normally_closed:
         yield (
             source_path,
             _RecoveryInfo(
                 recovered=False,
-                source_size=len(data),
+                source_size=source_size,
                 recovery_offset=None,
                 discarded_bytes=0,
                 complete_records=complete_records,
@@ -212,19 +257,14 @@ def _readable_mcap_path(
 
     with tempfile.TemporaryDirectory(prefix="hc_tj_mcap_recovery_") as tmp:
         recovered_path = Path(tmp) / source_path.name
-        recovered_path.write_bytes(
-            data[:recovery_offset]
-            + MCAP_DATA_END
-            + MCAP_EMPTY_FOOTER
-            + MCAP_MAGIC
-        )
+        _copy_prefix(source_path, recovered_path, recovery_offset)
         yield (
             recovered_path,
             _RecoveryInfo(
                 recovered=True,
-                source_size=len(data),
+                source_size=source_size,
                 recovery_offset=recovery_offset,
-                discarded_bytes=len(data) - recovery_offset,
+                discarded_bytes=source_size - recovery_offset,
                 complete_records=complete_records,
                 complete_chunks=complete_chunks,
             ),
@@ -599,6 +639,9 @@ def _nearest_sample(
 def _synchronize_source(
     source: _ParsedSource,
 ) -> tuple[list[_SynchronizedFrame], dict[str, Any]]:
+    """_summary_把不同时间戳的 RGB、深度、关节状态
+    和关节命令数据同步成一组组完整帧，同时生成同步质量统计。
+    """
     streams = {
         "depth": (source.depths, DEFAULT_DEPTH_TOLERANCE_NS),
         "joint_state": (
@@ -617,6 +660,7 @@ def _synchronize_source(
     errors: dict[str, list[int]] = {name: [] for name in streams}
     drops: Counter[str] = Counter()
     frames: list[_SynchronizedFrame] = []
+    # 按照rgb 来同步
     for color in source.colors:
         selected: dict[str, Any] = {}
         failed_stream = None
@@ -746,19 +790,31 @@ class _HcTjEpisodePackaging(EpisodePackaging):
             name=self.task_name,
             json_content={"description": self.instruction},
         )
-        for frame in self.frames:
-            timestamp_ns = frame.color.timestamp_ns
-            yield DataFrame(
-                features={
-                    "joints": self._joint_state(frame.joint_state),
-                    "actions": self._joint_state(frame.joint_command),
-                    "head": self._camera(frame.color, format_name="jpeg"),
-                    "head_depth": self._camera(frame.depth, format_name="png"),
-                },
-                instruction=instruction,
-                timestamp_ns_min=timestamp_ns,
-                timestamp_ns_max=timestamp_ns,
-            )
+        try:
+            for frame in self.frames:
+                timestamp_ns = frame.color.timestamp_ns
+                yield DataFrame(
+                    features={
+                        "joints": self._joint_state(frame.joint_state),
+                        "actions": self._joint_state(frame.joint_command),
+                        "head": self._camera(frame.color, format_name="jpeg"),
+                        "head_depth": self._camera(
+                            frame.depth, format_name="png"
+                        ),
+                    },
+                    instruction=instruction,
+                    timestamp_ns_min=timestamp_ns,
+                    timestamp_ns_max=timestamp_ns,
+                )
+        finally:
+            # Packaging consumes one episode before requesting the next.
+            # Release compressed buffers so directory conversion is bounded
+            # by one MCAP rather than all source episodes.
+            self.frames.clear()
+            self.source.colors.clear()
+            self.source.depths.clear()
+            self.source.joint_states.clear()
+            self.source.joint_commands.clear()
 
 
 def _dataset_features() -> hg_datasets.Features:
@@ -772,9 +828,127 @@ def _dataset_features() -> hg_datasets.Features:
     )
 
 
+def _resolve_input_paths(
+    input_path: str | Path | Sequence[str | Path],
+) -> list[Path]:
+    """Resolve files and directories into unique, ordered MCAP paths."""
+    raw_inputs = (
+        [input_path]
+        if isinstance(input_path, (str, Path))
+        else list(input_path)
+    )
+    if not raw_inputs:
+        raise ValueError("At least one input MCAP or directory is required")
+
+    resolved: set[Path] = set()
+    for raw_input in raw_inputs:
+        path = Path(raw_input).expanduser().resolve()
+        if path.is_dir():
+            resolved.update(item.resolve() for item in path.rglob("*.mcap"))
+        elif path.is_file():
+            if path.suffix != ".mcap":
+                raise ValueError(
+                    f"Input file must use the .mcap suffix: {path}"
+                )
+            resolved.add(path)
+        else:
+            raise FileNotFoundError(f"Input path does not exist: {path}")
+    if not resolved:
+        raise FileNotFoundError(
+            "No .mcap files were found in the provided input paths"
+        )
+    return sorted(resolved, key=str)
+
+
+def _sha256_file(source_path: Path) -> str:
+    """Hash a source MCAP without retaining its contents in memory."""
+    digest = hashlib.sha256()
+    with source_path.open("rb") as source:
+        for block in iter(lambda: source.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _episode_report(
+    source_path: Path,
+    source_sha256: str,
+    recovery: _RecoveryInfo,
+    parsed: _ParsedSource,
+    frame_report: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the audit report for one converted source episode."""
+    return {
+        "source": {
+            "path": str(source_path),
+            "size_bytes": recovery.source_size,
+            "sha256": source_sha256,
+        },
+        "recovery": {
+            "recovered": recovery.recovered,
+            "complete_records": recovery.complete_records,
+            "complete_chunks": recovery.complete_chunks,
+            "recovery_offset": recovery.recovery_offset,
+            "discarded_bytes": recovery.discarded_bytes,
+        },
+        "messages": parsed.message_counts,
+        "joint_command_zero_tail_messages": (
+            parsed.command_zero_tail_messages
+        ),
+        "frames": frame_report,
+    }
+
+
+class _HcTjEpisodeCollection:
+    """Lazily parse ordered MCAP paths into pickleable episode sources."""
+
+    def __init__(
+        self,
+        *,
+        source_paths: list[Path],
+        urdf_content: str,
+        task_name: str,
+        instruction: str,
+        recover_truncated: bool,
+    ) -> None:
+        self.source_paths = source_paths
+        self.urdf_content = urdf_content
+        self.task_name = task_name
+        self.instruction = instruction
+        self.recover_truncated = recover_truncated
+        self.reports: list[dict[str, Any]] = []
+
+    def __iter__(self) -> Iterator[_HcTjEpisodePackaging]:
+        self.reports.clear()
+        for source_path in self.source_paths:
+            source_sha256 = _sha256_file(source_path)
+            with _readable_mcap_path(source_path, self.recover_truncated) as (
+                read_path,
+                recovery,
+            ):
+                parsed = _load_source(read_path)
+                frames, frame_report = _synchronize_source(parsed)
+            self.reports.append(
+                _episode_report(
+                    source_path,
+                    source_sha256,
+                    recovery,
+                    parsed,
+                    frame_report,
+                )
+            )
+            yield _HcTjEpisodePackaging(
+                frames=frames,
+                source=parsed,
+                urdf_content=self.urdf_content,
+                task_name=self.task_name,
+                instruction=self.instruction,
+                source_sha256=source_sha256,
+            )
+
+
 def convert_hc_tj_mcap(
     *,
-    input_path: str | Path,
+    input_path: str | Path | Sequence[str | Path],
     output_path: str | Path,
     urdf_path: str | Path,
     task_name: str,
@@ -782,10 +956,11 @@ def convert_hc_tj_mcap(
     recover_truncated: bool = False,
     force_overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Convert one hc_tj MCAP into a single-episode HoloBrain RODataset.
+    """Convert hc_tj MCAP files into one multi-episode HoloBrain RODataset.
 
     Args:
-        input_path: Source MCAP. It is always read-only and never rewritten.
+        input_path: A source MCAP, a recursively searched directory, or a
+            sequence of either. Inputs are read-only and never rewritten.
         output_path: Local destination directory for the RODataset.
         urdf_path: hc_tj URDF stored with the episode metadata.
         task_name: Stable task identifier.
@@ -803,11 +978,9 @@ def convert_hc_tj_mcap(
             contract.
         FileExistsError: If the destination exists without force overwrite.
     """
-    source_path = Path(input_path).expanduser().resolve()
+    source_paths = _resolve_input_paths(input_path)
     destination = Path(output_path).expanduser().resolve()
     robot_path = Path(urdf_path).expanduser().resolve()
-    if not source_path.is_file():
-        raise FileNotFoundError(f"Input MCAP does not exist: {source_path}")
     if not robot_path.is_file():
         raise FileNotFoundError(f"URDF does not exist: {robot_path}")
     if not task_name.strip():
@@ -815,54 +988,59 @@ def convert_hc_tj_mcap(
     if not instruction.strip():
         raise ValueError("instruction must not be blank")
 
-    source_bytes = source_path.read_bytes()
-    source_sha256 = hashlib.sha256(source_bytes).hexdigest()
-    with _readable_mcap_path(source_path, recover_truncated) as (
-        read_path,
-        recovery,
-    ):
-        parsed = _load_source(read_path)
-        frames, frame_report = _synchronize_source(parsed)
-
-    episode = _HcTjEpisodePackaging(
-        frames=frames,
-        source=parsed,
-        urdf_content=robot_path.read_text(encoding="utf-8"),
+    urdf_content = robot_path.read_text(encoding="utf-8")
+    episodes = _HcTjEpisodeCollection(
+        source_paths=source_paths,
+        urdf_content=urdf_content,
         task_name=task_name.strip(),
         instruction=instruction.strip(),
-        source_sha256=source_sha256,
-    )
-    DatasetPackaging(features=_dataset_features()).packaging(
-        episodes=[episode],
-        dataset_path=destination,
-        force_overwrite=force_overwrite,
-        fail_fast=True,
+        recover_truncated=recover_truncated,
     )
 
-    report: dict[str, Any] = {
-        "source": {
-            "path": str(source_path),
-            "size_bytes": len(source_bytes),
-            "sha256": source_sha256,
-        },
-        "recovery": {
-            "recovered": recovery.recovered,
-            "complete_records": recovery.complete_records,
-            "complete_chunks": recovery.complete_chunks,
-            "recovery_offset": recovery.recovery_offset,
-            "discarded_bytes": recovery.discarded_bytes,
-        },
-        "messages": parsed.message_counts,
-        "joint_command_zero_tail_messages": (
-            parsed.command_zero_tail_messages
-        ),
-        "frames": frame_report,
-    }
-    report_path = destination / "conversion_report.json"
-    report_path.write_text(
-        json.dumps(report, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    if destination.exists() and not force_overwrite:
+        raise FileExistsError(
+            f"The dataset path '{destination}' already exists. "
+            "Use force_overwrite=True to replace it."
+        )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{destination.name}.staging-", dir=destination.parent
+    ) as temporary_parent:
+        staging = Path(temporary_parent) / "dataset"
+        DatasetPackaging(features=_dataset_features()).packaging(
+            episodes=episodes,
+            dataset_path=staging,
+            fail_fast=True,
+        )
+
+        episode_reports = episodes.reports
+        report: dict[str, Any] = {
+            "episode_count": len(episode_reports),
+            "total_frames": sum(
+                episode_report["frames"]["output_frames"]
+                for episode_report in episode_reports
+            ),
+            "episodes": episode_reports,
+        }
+        if len(episode_reports) == 1:
+            # Preserve the original single-file report contract.
+            report.update(episode_reports[0])
+
+        report_path = staging / "conversion_report.json"
+        report_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        backup = Path(temporary_parent) / "previous_dataset"
+        if destination.exists():
+            destination.rename(backup)
+        try:
+            staging.rename(destination)
+        except Exception:
+            if backup.exists():
+                backup.rename(destination)
+            raise
     return report
 
 
@@ -870,7 +1048,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Convert an hc_tj MCAP to HoloBrain RODataset Arrow data."
     )
-    parser.add_argument("--input", required=True, dest="input_path")
+    parser.add_argument(
+        "--input",
+        required=True,
+        nargs="+",
+        dest="input_path",
+        help=(
+            "One or more MCAP files or directories "
+            "(directories are recursive)."
+        ),
+    )
     parser.add_argument("--output", required=True, dest="output_path")
     parser.add_argument("--urdf", required=True, dest="urdf_path")
     parser.add_argument("--task-name", default="hc_tj")

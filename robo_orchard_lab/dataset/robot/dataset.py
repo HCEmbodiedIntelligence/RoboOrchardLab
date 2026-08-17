@@ -673,7 +673,9 @@ class RODataset(TorchDataset):
                 if `index` is a string, returns the data for that column.
                 Otherwise, returns a dict with the frame data.
         """
-
+        #['joints', 'actions', 'head', 'head_depth', 
+        # 'index', 'episode_index', 'frame_index', 'task_index', 
+        # 'robot_index', 'instruction_index', 'timestamp_min', 'timestamp_max']
         ret: dict | list = self.frame_dataset[index]
         if self.meta_index2meta:
             if isinstance(ret, dict):

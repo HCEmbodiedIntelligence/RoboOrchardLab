@@ -40,6 +40,7 @@ from projects.holobrain.scripts.convert_hc_tj_mcap import (
     convert_hc_tj_mcap,
 )
 from robo_orchard_lab.dataset.robot import RODataset
+from robo_orchard_lab.dataset.robot.db_orm import Episode
 
 
 def _encode_image(image: np.ndarray, suffix: str) -> bytes:
@@ -247,6 +248,9 @@ def test_synthetic_mcap_converts_to_ro_dataset(tmp_path: Path) -> None:
     )
 
     assert report["recovery"]["recovered"] is False
+    assert report["episode_count"] == 1
+    assert report["total_frames"] == 2
+    assert len(report["episodes"]) == 1
     assert report["frames"]["candidate_rgb_frames"] == 2
     assert report["frames"]["output_frames"] == 2
     assert report["joint_command_zero_tail_messages"] == 2
@@ -277,3 +281,93 @@ def test_synthetic_mcap_converts_to_ro_dataset(tmp_path: Path) -> None:
     )
     assert decoded_depth.dtype == np.uint16
     assert decoded_depth.shape == (4, 6)
+
+
+def test_mcap_directory_converts_to_multi_episode_dataset(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "sources"
+    nested = source_root / "nested"
+    nested.mkdir(parents=True)
+    first = _write_synthetic_mcap(source_root / "episode_b")
+    second = _write_synthetic_mcap(nested / "episode_a")
+    output = tmp_path / "dataset"
+    urdf = (
+        Path(__file__).resolve().parents[4]
+        / "hc_assets"
+        / "hc_tj_description"
+        / "urdf"
+        / "hc_tj_robot.urdf"
+    )
+
+    report = convert_hc_tj_mcap(
+        input_path=source_root,
+        output_path=output,
+        urdf_path=urdf,
+        task_name="synthetic_hc_tj",
+        instruction="Move both arms.",
+    )
+
+    assert report["episode_count"] == 2
+    assert report["total_frames"] == 4
+    assert [item["source"]["path"] for item in report["episodes"]] == sorted(
+        [str(first.resolve()), str(second.resolve())]
+    )
+    assert all(
+        item["frames"]["output_frames"] == 2 for item in report["episodes"]
+    )
+    dataset = RODataset(str(output))
+    assert len(dataset) == 4
+    assert len(list(dataset.iterate_meta(Episode))) == 2
+    assert [dataset[index]["frame_index"] for index in range(4)] == [
+        0,
+        1,
+        0,
+        1,
+    ]
+
+
+def test_empty_mcap_directory_is_rejected(tmp_path: Path) -> None:
+    source = tmp_path / "empty"
+    source.mkdir()
+    with pytest.raises(FileNotFoundError, match="No .mcap files"):
+        convert_hc_tj_mcap(
+            input_path=source,
+            output_path=tmp_path / "dataset",
+            urdf_path=tmp_path / "unused.urdf",
+            task_name="hc_tj",
+            instruction="Move both arms.",
+        )
+
+
+def test_failed_force_overwrite_preserves_existing_dataset(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "sources"
+    source.mkdir()
+    _write_synthetic_mcap(source / "episode_a")
+    (source / "episode_z.mcap").write_bytes(b"not an MCAP")
+    output = tmp_path / "dataset"
+    output.mkdir()
+    marker = output / "existing.txt"
+    marker.write_text("keep me", encoding="utf-8")
+    urdf = (
+        Path(__file__).resolve().parents[4]
+        / "hc_assets"
+        / "hc_tj_description"
+        / "urdf"
+        / "hc_tj_robot.urdf"
+    )
+
+    with pytest.raises(ValueError, match="leading magic is invalid"):
+        convert_hc_tj_mcap(
+            input_path=source,
+            output_path=output,
+            urdf_path=urdf,
+            task_name="synthetic_hc_tj",
+            instruction="Move both arms.",
+            force_overwrite=True,
+        )
+
+    assert marker.read_text(encoding="utf-8") == "keep me"
+    assert list(output.iterdir()) == [marker]
