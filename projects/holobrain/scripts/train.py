@@ -136,8 +136,8 @@ def main(args, accelerator):
     model = build_model(config)
 
     #DEBUG:
-    # num_workers = config.get("num_workers", 4)
-    num_workers = 0
+    num_workers = config.get("num_workers", 4)
+    # num_workers = 0
     if not args.eval_only:
         #NOTE: dataset keys:
         #['uuid', 'imgs', 'depths', 'text', 'state_loss_weights',
