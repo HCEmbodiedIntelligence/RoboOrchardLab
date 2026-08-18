@@ -20,6 +20,7 @@ import logging
 import os
 import sys
 from io import BytesIO
+from typing import Any
 
 _REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir)
@@ -49,6 +50,8 @@ logger = LoggerManager().get_child(__name__)
 CONTROL_HZ = 200  # Hz for realbot control
 TRAINING_HZ = 30  # Hz for training
 INTERPOLATION = CONTROL_HZ / TRAINING_HZ
+TRI_CAMERA_PROFILE = "tri_camera_dual_arm"
+HC_TJ_PROFILE = "hc_tj"
 
 
 class Config(SettingConfig):
@@ -65,6 +68,8 @@ class Config(SettingConfig):
     """The number of joints."""
     valid_action_step: int = 64
     """The number of valid action steps."""
+    input_profile: str = TRI_CAMERA_PROFILE
+    """Request schema: ``tri_camera_dual_arm`` or hc_tj-specific ``hc_tj``."""
 
 
 parser = argparse.ArgumentParser(description=Config.__doc__)
@@ -89,7 +94,46 @@ logger.info(f"Model server {args.server_name} started on port {args.port}")
 app = Flask(__name__)
 
 
-def decode_request(request_data) -> MultiArmManipulationInput:
+def _load_npy(
+    request_data: dict[str, Any], name: str, dtype 
+) -> np.ndarray:
+    """Load one multipart ``.npy`` field with an explicit dtype."""
+    return np.load(BytesIO(request_data[name].read())).astype(dtype)
+
+
+def _decode_hc_tj_request(
+    request_data: dict[str, Any],
+) -> MultiArmManipulationInput:
+    """Decode hc_tj's head RGB-D, zhi_Link-to-eye and 14-joint schema."""
+    intrinsic = np.eye(4, dtype=np.float64)
+    intrinsic[:3, :3] = _load_npy(request_data, "head_intrinsic", np.float64)
+    right_arm_state = _load_npy(request_data, "right_arm_state", np.float32)
+    left_arm_state = _load_npy(request_data, "left_arm_state", np.float32)
+    joint_state = np.concatenate([right_arm_state, left_arm_state], axis=-1)[
+        None, :
+    ]
+    return MultiArmManipulationInput(
+        image={"head": [_load_npy(request_data, "head_color", np.uint8)]},
+        depth={
+            "head": [
+                _load_npy(request_data, "head_depth", np.float64) / 1000.0
+            ]
+        },
+        history_joint_state=joint_state,
+        intrinsic={"head": intrinsic},
+        t_world2cam={
+            "head": _load_npy(request_data, "head_world2cam", np.float64)
+        },
+        instruction=request_data.get("instruction", ""),
+    )
+
+
+def decode_request(request_data: dict[str, Any]) -> MultiArmManipulationInput:
+    """Decode a multipart request according to the configured robot profile."""
+    if args.input_profile == HC_TJ_PROFILE:
+        return _decode_hc_tj_request(request_data)
+    if args.input_profile != TRI_CAMERA_PROFILE:
+        raise ValueError(f"Unsupported input profile: {args.input_profile!r}")
     images = {
         "left": [
             np.load(BytesIO(request_data["left_color"].read())).astype(
@@ -203,17 +247,19 @@ def infer(request_data):
         )[0].permute(1, 0)
         actions = actions[: int(args.valid_action_step * INTERPOLATION)]
 
-        res = dict(
-            left_arm_actions=actions[:, : args.num_joints]
-            .cpu()
-            .numpy()
-            .tolist(),
-            right_arm_actions=actions[:, args.num_joints :]
-            .cpu()
-            .numpy()
-            .tolist(),
-            action_horizon=len(actions),
-        )
+        action_values = actions.cpu().numpy()
+        if args.input_profile == HC_TJ_PROFILE:
+            res = dict(
+                right_arm_actions=action_values[:, : args.num_joints].tolist(),
+                left_arm_actions=action_values[:, args.num_joints :].tolist(),
+                action_horizon=len(actions),
+            )
+        else:
+            res = dict(
+                left_arm_actions=action_values[:, : args.num_joints].tolist(),
+                right_arm_actions=action_values[:, args.num_joints :].tolist(),
+                action_horizon=len(actions),
+            )
         return res
     except Exception as e:
         logging.exception(f"Error during inference: {e}")
@@ -239,6 +285,16 @@ def model_infer():
             "right_arm_state",
             "instruction",
         ]
+        if args.input_profile == HC_TJ_PROFILE:
+            required_keys = [
+                "head_color",
+                "head_depth",
+                "head_intrinsic",
+                "head_world2cam",
+                "right_arm_state",
+                "left_arm_state",
+                "instruction",
+            ]
         for key in required_keys:
             if key not in data:
                 return jsonify({"error": f"Missing key: {key}"}), 400
