@@ -38,11 +38,15 @@ _URDF_PATH = (
     / "hc_tj_robot.urdf"
 )
 _DATASET_PATH = (
-    Path(__file__).resolve().parents[1] / "data" / "arrow_dataset" / "hc_tj"
+    Path(__file__).resolve().parents[1]
+    / "data"
+    / "arrow_dataset"
+    / "hc_tj_260818_fix"
 )
 _RIGHT_JOINT_NAMES = [f"Joint{i}_R" for i in range(1, 8)]
 _LEFT_JOINT_NAMES = [f"Joint{i}_L" for i in range(1, 8)]
 _ARM_JOINT_NAMES = _RIGHT_JOINT_NAMES + _LEFT_JOINT_NAMES
+_GRIPPER_SCALE_SHIFT = (0.5, 0.5)
 
 
 def _joint_scale_shift_from_urdf(urdf: Path) -> list[list[float]]:
@@ -63,10 +67,16 @@ def _joint_scale_shift_from_urdf(urdf: Path) -> list[list[float]]:
     missing = [name for name in _ARM_JOINT_NAMES if name not in limits]
     if missing:
         raise ValueError(f"hc_tj URDF is missing joint limits for {missing}")
-    return [
+    arm_scale_shift = [
         [(upper - lower) / 2, (upper + lower) / 2]
         for lower, upper in (limits[name] for name in _ARM_JOINT_NAMES)
     ]
+    return (
+        arm_scale_shift[:7]
+        + [list(_GRIPPER_SCALE_SHIFT)]
+        + arm_scale_shift[7:]
+        + [list(_GRIPPER_SCALE_SHIFT)]
+    )
 
 
 def _base_to_zhi_from_zero_pose(urdf: Path) -> list[list[float]]:
@@ -175,12 +185,21 @@ def build_transforms(config, mode, data_config):
         UnsqueezeBatch,
     )
 
-    state_weight = [1.0, 1.0, 1.0, 1.0, 0.1, 0.1, 0.1, 0.1]
-    loss_weights = np.asarray([[state_weight] * 14], dtype=np.float32)
+    arm_state_weight = [1.0, 1.0, 1.0, 1.0, 0.1, 0.1, 0.1, 0.1]
+    gripper_state_weight = [1.0, 2.0, 2.0, 2.0, 0.2, 0.2, 0.2, 0.2]
+    loss_weights = np.asarray(
+        [
+            [arm_state_weight] * 7
+            + [gripper_state_weight]
+            + [arm_state_weight] * 7
+            + [gripper_state_weight]
+        ],
+        dtype=np.float32,
+    )
     add_items = {
         "type": AddItems,
         "T_base2world": data_config["T_base2world"],
-        "joint_mask": [True] * 14,
+        "joint_mask": ([True] * 7 + [False]) * 2,
         "joint_scale_shift": data_config["joint_scale_shift"],
     }
     if mode == "training":
@@ -223,7 +242,7 @@ def build_transforms(config, mode, data_config):
             [f"Link{i}_R" for i in range(1, 8)],
             [f"Link{i}_L" for i in range(1, 8)],
         ],
-        "finger_keys": [[], []],
+        "finger_keys": [["R_ban_Link"], ["L_ban_Link"]],
     }
     kinematics = {"type": MultiArmKinematics, **kinematics_config}
 
@@ -260,7 +279,12 @@ def build_transforms(config, mode, data_config):
             projection,
             {
                 "type": JointStateNoise,
-                "noise_range": [[-0.02, 0.02]] * 14,
+                "noise_range": (
+                    [[-0.02, 0.02]] * 7
+                    + [[0.0, 0.0]]
+                    + [[-0.02, 0.02]] * 7
+                    + [[0.0, 0.0]]
+                ),
                 "add_to_pred": True,
             },
             convert_dtype,

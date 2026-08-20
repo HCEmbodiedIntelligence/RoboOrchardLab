@@ -14,7 +14,7 @@
 # implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
-"""RODataset reader for the hc_tj 14-axis dual-arm embodiment."""
+"""RODataset reader for the hc_tj 16-axis dual-arm embodiment."""
 
 from __future__ import annotations
 from typing import Callable
@@ -40,7 +40,9 @@ _REFERENCE_FRAME = "zhi_Link"
 _CAMERA_FRAME = "eye"
 _JOINT_NAMES = [
     *[f"Joint{i}_R" for i in range(1, 8)],
+    "R_ban",
     *[f"Joint{i}_L" for i in range(1, 8)],
+    "L_ban",
 ]
 
 
@@ -82,9 +84,10 @@ class _HcTjArrowDataParse:
                 )
         values = np.stack([state.position for state in states])
         values = values.squeeze(1).astype(np.float64)
-        if values.ndim != 2 or values.shape[1] != 14:
+        if values.ndim != 2 or values.shape[1] != len(_JOINT_NAMES):
             raise ValueError(
-                f"hc_tj {column} must have shape (steps, 14), got "
+                f"hc_tj {column} must have shape "
+                f"(steps, {len(_JOINT_NAMES)}), got "
                 f"{values.shape}"
             )
         return values
@@ -157,7 +160,7 @@ class HcTjRODataset(TorchDataset):
     """Read hc_tj RODatasets for HoloBrain training.
 
     This adapter is specific to the hc_tj embodiment: it materializes
-    RODataset metadata, samples 14-axis right-then-left arm chunks, decodes the
+    RODataset metadata, samples 16-axis arm-and-gripper chunks, decodes the
     single aligned head RGB/depth pair, and preserves ``zhi_Link`` as the
     camera and kinematics reference.
 

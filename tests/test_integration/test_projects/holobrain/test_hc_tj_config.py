@@ -23,7 +23,11 @@ import pytest
 CONFIG_DIR = Path(__file__).resolve().parents[4] / "projects/holobrain/configs"
 sys.path.insert(0, str(CONFIG_DIR))
 
-from config_hc_tj_ro_dataset import _select_episodes  # noqa: E402
+from config_hc_tj_ro_dataset import (  # noqa: E402
+    _select_episodes,
+    build_transforms,
+    dataset_config,
+)
 
 
 class _Dataset:
@@ -60,3 +64,41 @@ def test_select_episodes_rejects_invalid_indices(episode_indices):
 def test_select_episodes_rejects_non_integer_indices(episode_indices):
     with pytest.raises(TypeError):
         _select_episodes(_Dataset(), episode_indices)
+
+
+def test_hc_tj_transforms_use_per_arm_gripper_layout():
+    data_config = dataset_config["hc_tj"]
+    transforms = build_transforms(
+        {"hist_steps": 1, "pred_steps": 2, "patch_size": 1},
+        "training",
+        data_config,
+    )
+    by_type = {
+        item["type"].__name__: item
+        for item in transforms
+        if isinstance(item, dict) and "type" in item
+    }
+
+    assert len(data_config["joint_scale_shift"]) == 16
+    assert data_config["joint_scale_shift"][7] == [0.5, 0.5]
+    assert data_config["joint_scale_shift"][15] == [0.5, 0.5]
+    assert by_type["AddItems"]["joint_mask"] == ([True] * 7 + [False]) * 2
+    assert by_type["MultiArmKinematics"]["finger_keys"] == [
+        ["R_ban_Link"],
+        ["L_ban_Link"],
+    ]
+    assert len(by_type["JointStateNoise"]["noise_range"]) == 16
+    assert by_type["JointStateNoise"]["noise_range"][7] == [0.0, 0.0]
+    assert by_type["JointStateNoise"]["noise_range"][15] == [0.0, 0.0]
+
+
+def test_hc_tj_config_uses_fixed_16_axis_dataset():
+    data_config = dataset_config["hc_tj"]
+    assert data_config["data_paths"] == [
+        str(
+            CONFIG_DIR.parent
+            / "data"
+            / "arrow_dataset"
+            / "hc_tj_260818_fix"
+        )
+    ]

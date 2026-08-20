@@ -67,6 +67,8 @@ COLOR_TOPIC = "/io_teleop/camera_head/color"
 DEPTH_TOPIC = "/io_teleop/camera_head/depth"
 JOINT_STATE_TOPIC = "io_teleop/joint_states"
 JOINT_COMMAND_TOPIC = "io_teleop/joint_cmd"
+RIGHT_FINGER_COMMAND_TOPIC = "/io_teleop/joint_cmd_finger_right"
+LEFT_FINGER_COMMAND_TOPIC = "/io_teleop/joint_cmd_finger_left"
 CALIBRATION_TOPIC = "/io_teleop/camera_head/calibration"
 EXTRINSICS_TOPIC = "/io_teleop/camera_head/extrinsics"
 
@@ -75,6 +77,8 @@ EXPECTED_TOPIC_TYPES = {
     DEPTH_TOPIC: "sensor_msgs/msg/CompressedImage",
     JOINT_STATE_TOPIC: "sensor_msgs/msg/JointState",
     JOINT_COMMAND_TOPIC: "sensor_msgs/msg/JointState",
+    RIGHT_FINGER_COMMAND_TOPIC: "sensor_msgs/msg/JointState",
+    LEFT_FINGER_COMMAND_TOPIC: "sensor_msgs/msg/JointState",
     CALIBRATION_TOPIC: "std_msgs/msg/String",
     EXTRINSICS_TOPIC: "std_msgs/msg/String",
 }
@@ -82,10 +86,21 @@ EXPECTED_TOPIC_TYPES = {
 ARM_JOINT_NAMES = tuple(
     [f"Joint{i}_R" for i in range(1, 8)] + [f"Joint{i}_L" for i in range(1, 8)]
 )
+RIGHT_ARM_JOINT_NAMES = ARM_JOINT_NAMES[:7]
+LEFT_ARM_JOINT_NAMES = ARM_JOINT_NAMES[7:]
+RIGHT_FINGER_JOINT_NAME = "R_ban"
+LEFT_FINGER_JOINT_NAME = "L_ban"
+HOLOBRAIN_JOINT_NAMES = (
+    RIGHT_ARM_JOINT_NAMES
+    + (RIGHT_FINGER_JOINT_NAME,)
+    + LEFT_ARM_JOINT_NAMES
+    + (LEFT_FINGER_JOINT_NAME,)
+)
 EXPECTED_SOURCE_JOINT_NAMES = ARM_JOINT_NAMES + ("leg_1", "leg_2", "zhi")
 
 DEFAULT_DEPTH_TOLERANCE_NS = 50_000_000
 DEFAULT_JOINT_TOLERANCE_NS = 20_000_000
+DEFAULT_FINGER_TOLERANCE_NS = 150_000_000
 
 
 @dataclass(slots=True)
@@ -114,11 +129,19 @@ class _JointSample:
 
 
 @dataclass(slots=True)
+class _FingerSample:
+    timestamp_ns: int
+    position: float
+
+
+@dataclass(slots=True)
 class _ParsedSource:
     colors: list[_CompressedSample]
     depths: list[_CompressedSample]
     joint_states: list[_JointSample]
     joint_commands: list[_JointSample]
+    right_finger_commands: list[_FingerSample]
+    left_finger_commands: list[_FingerSample]
     intrinsic_mat: np.ndarray
     distortion: np.ndarray
     image_hw: tuple[int, int]
@@ -126,6 +149,7 @@ class _ParsedSource:
     camera_to_zhi_quat_wxyz: np.ndarray
     message_counts: dict[str, int]
     command_zero_tail_messages: int
+    finger_trimmed_tail_messages: int
 
 
 @dataclass(slots=True)
@@ -134,6 +158,8 @@ class _SynchronizedFrame:
     depth: _CompressedSample
     joint_state: _JointSample
     joint_command: _JointSample
+    right_finger_command: _FingerSample
+    left_finger_command: _FingerSample
 
 
 def _normalize_msgtype(msgtype: str) -> str:
@@ -277,14 +303,18 @@ def _deserialize_message(
     msgtype: str,
     *,
     allow_zero_tail: bool,
+    allow_eight_byte_tail: bool = False,
 ) -> tuple[Any, bool]:
-    """Deserialize CDR with the hc_tj command's exact zero-tail exception."""
+    """Deserialize CDR with topic-specific eight-byte tail exceptions."""
     raw_bytes = bytes(raw)
     try:
         return typestore.deserialize_cdr(raw_bytes, msgtype), False
     except Exception as original_error:
         tail = raw_bytes[-8:]
-        if not allow_zero_tail or len(tail) != 8 or tail != bytes(8):
+        tail_allowed = len(tail) == 8 and (
+            allow_eight_byte_tail or (allow_zero_tail and tail == bytes(8))
+        )
+        if not tail_allowed:
             raise ValueError(
                 f"Failed to deserialize {msgtype}; unsupported trailing data "
                 "or malformed CDR payload"
@@ -336,6 +366,32 @@ def _parse_joint_sample(
         velocity=select(message.velocity, "velocity"),
         effort=select(message.effort, "effort"),
     )
+
+
+def _parse_finger_sample(
+    message: Any,
+    timestamp_ns: int,
+    topic: str,
+    expected_name: str,
+) -> _FingerSample:
+    """Parse one binary gripper command from a singleton JointState."""
+    names = tuple(message.name)
+    if names != (expected_name,):
+        raise ValueError(
+            f"{topic} joint order mismatch: expected {[expected_name]}, "
+            f"got {list(names)}"
+        )
+    if len(message.position) != 1:
+        raise ValueError(
+            f"{topic} position must contain exactly one value, got "
+            f"{len(message.position)}"
+        )
+    position = float(message.position[0])
+    if not math.isfinite(position) or position not in (0.0, 1.0):
+        raise ValueError(
+            f"{topic} position must be the binary end-effector state 0 or 1"
+        )
+    return _FingerSample(timestamp_ns=timestamp_ns, position=position)
 
 
 def _json_object(message: Any, topic: str) -> dict[str, Any]:
@@ -514,10 +570,13 @@ def _load_source(read_path: Path) -> _ParsedSource:
     depths: list[_CompressedSample] = []
     joint_states: list[_JointSample] = []
     joint_commands: list[_JointSample] = []
+    right_finger_commands: list[_FingerSample] = []
+    left_finger_commands: list[_FingerSample] = []
     calibration_values: list[dict[str, Any]] = []
     extrinsics_values: list[dict[str, Any]] = []
     counts: Counter[str] = Counter()
     command_zero_tail_messages = 0
+    finger_trimmed_tail_messages = 0
     typestore = get_typestore(Stores.ROS2_HUMBLE)
 
     with AnyReader([read_path]) as reader:
@@ -556,9 +615,14 @@ def _load_source(read_path: Path) -> _ParsedSource:
                 raw,
                 msgtype,
                 allow_zero_tail=topic == JOINT_COMMAND_TOPIC,
+                allow_eight_byte_tail=topic
+                in (RIGHT_FINGER_COMMAND_TOPIC, LEFT_FINGER_COMMAND_TOPIC),
             )
             counts[topic] += 1
-            command_zero_tail_messages += trimmed
+            if trimmed and topic == JOINT_COMMAND_TOPIC:
+                command_zero_tail_messages += 1
+            elif trimmed:
+                finger_trimmed_tail_messages += 1
             timestamp_ns = _header_timestamp_ns(message, log_time_ns)
             if topic == COLOR_TOPIC or topic == DEPTH_TOPIC:
                 sample = _CompressedSample(
@@ -574,6 +638,18 @@ def _load_source(read_path: Path) -> _ParsedSource:
             elif topic == JOINT_COMMAND_TOPIC:
                 joint_commands.append(
                     _parse_joint_sample(message, timestamp_ns, topic)
+                )
+            elif topic == RIGHT_FINGER_COMMAND_TOPIC:
+                right_finger_commands.append(
+                    _parse_finger_sample(
+                        message, timestamp_ns, topic, RIGHT_FINGER_JOINT_NAME
+                    )
+                )
+            elif topic == LEFT_FINGER_COMMAND_TOPIC:
+                left_finger_commands.append(
+                    _parse_finger_sample(
+                        message, timestamp_ns, topic, LEFT_FINGER_JOINT_NAME
+                    )
                 )
             elif topic == CALIBRATION_TOPIC:
                 calibration_values.append(_json_object(message, topic))
@@ -592,7 +668,14 @@ def _load_source(read_path: Path) -> _ParsedSource:
     _validate_compressed_samples(
         depths, topic=DEPTH_TOPIC, image_hw=image_hw, depth=True
     )
-    for series in (colors, depths, joint_states, joint_commands):
+    for series in (
+        colors,
+        depths,
+        joint_states,
+        joint_commands,
+        right_finger_commands,
+        left_finger_commands,
+    ):
         series.sort(key=lambda sample: sample.timestamp_ns)
     if not joint_states:
         raise ValueError(f"Required topic {JOINT_STATE_TOPIC} has no messages")
@@ -600,11 +683,21 @@ def _load_source(read_path: Path) -> _ParsedSource:
         raise ValueError(
             f"Required topic {JOINT_COMMAND_TOPIC} has no messages"
         )
+    if not right_finger_commands:
+        raise ValueError(
+            f"Required topic {RIGHT_FINGER_COMMAND_TOPIC} has no messages"
+        )
+    if not left_finger_commands:
+        raise ValueError(
+            f"Required topic {LEFT_FINGER_COMMAND_TOPIC} has no messages"
+        )
     return _ParsedSource(
         colors=colors,
         depths=depths,
         joint_states=joint_states,
         joint_commands=joint_commands,
+        right_finger_commands=right_finger_commands,
+        left_finger_commands=left_finger_commands,
         intrinsic_mat=intrinsic_mat,
         distortion=distortion,
         image_hw=image_hw,
@@ -612,6 +705,7 @@ def _load_source(read_path: Path) -> _ParsedSource:
         camera_to_zhi_quat_wxyz=camera_to_zhi_quat_wxyz,
         message_counts=dict(sorted(counts.items())),
         command_zero_tail_messages=command_zero_tail_messages,
+        finger_trimmed_tail_messages=finger_trimmed_tail_messages,
     )
 
 
@@ -639,8 +733,10 @@ def _nearest_sample(
 def _synchronize_source(
     source: _ParsedSource,
 ) -> tuple[list[_SynchronizedFrame], dict[str, Any]]:
-    """_summary_把不同时间戳的 RGB、深度、关节状态
-    和关节命令数据同步成一组组完整帧，同时生成同步质量统计。
+    """Synchronize source streams to RGB frames and report alignment.
+
+    Finger commands are lower-rate binary states, so they use a wider
+    nearest-neighbor tolerance than the arm joint streams.
     """
     streams = {
         "depth": (source.depths, DEFAULT_DEPTH_TOLERANCE_NS),
@@ -651,6 +747,14 @@ def _synchronize_source(
         "joint_command": (
             source.joint_commands,
             DEFAULT_JOINT_TOLERANCE_NS,
+        ),
+        "right_finger_command": (
+            source.right_finger_commands,
+            DEFAULT_FINGER_TOLERANCE_NS,
+        ),
+        "left_finger_command": (
+            source.left_finger_commands,
+            DEFAULT_FINGER_TOLERANCE_NS,
         ),
     }
     timestamp_lists = {
@@ -682,6 +786,8 @@ def _synchronize_source(
                 depth=selected["depth"],
                 joint_state=selected["joint_state"],
                 joint_command=selected["joint_command"],
+                right_finger_command=selected["right_finger_command"],
+                left_finger_command=selected["left_finger_command"],
             )
         )
     if not frames:
@@ -745,12 +851,40 @@ class _HcTjEpisodePackaging(EpisodePackaging):
         )
 
     @staticmethod
-    def _joint_state(sample: _JointSample) -> BatchJointsState:
+    def _joint_state(
+        sample: _JointSample,
+        right_finger: _FingerSample,
+        left_finger: _FingerSample,
+    ) -> BatchJointsState:
+        """Insert each binary gripper state after its seven arm joints.
+
+        The finger topics carry position only, so their velocity and effort
+        entries are always zero in the returned 16-axis state.
+        """
+        right_arm = len(RIGHT_ARM_JOINT_NAMES)
+
+        def with_fingers(
+            values: np.ndarray, right_value: float, left_value: float
+        ) -> np.ndarray:
+            return np.concatenate(
+                (
+                    values[:right_arm],
+                    np.asarray([right_value], dtype=np.float32),
+                    values[right_arm:],
+                    np.asarray([left_value], dtype=np.float32),
+                )
+            )
+
+        position = with_fingers(
+            sample.position, right_finger.position, left_finger.position
+        )
+        velocity = with_fingers(sample.velocity, 0.0, 0.0)
+        effort = with_fingers(sample.effort, 0.0, 0.0)
         return BatchJointsState(
-            position=torch.from_numpy(sample.position[None]),
-            velocity=torch.from_numpy(sample.velocity[None]),
-            effort=torch.from_numpy(sample.effort[None]),
-            names=list(ARM_JOINT_NAMES),
+            position=torch.from_numpy(position[None]),
+            velocity=torch.from_numpy(velocity[None]),
+            effort=torch.from_numpy(effort[None]),
+            names=list(HOLOBRAIN_JOINT_NAMES),
             timestamps=[sample.timestamp_ns],
         )
 
@@ -785,7 +919,7 @@ class _HcTjEpisodePackaging(EpisodePackaging):
         )
 
     def generate_frames(self) -> Generator[DataFrame, None, None]:
-        """Yield frames keyed by RGB time with 14-axis state and action."""
+        """Yield RGB-keyed frames with 16-axis arm and gripper states."""
         instruction = InstructionData(
             name=self.task_name,
             json_content={"description": self.instruction},
@@ -795,8 +929,19 @@ class _HcTjEpisodePackaging(EpisodePackaging):
                 timestamp_ns = frame.color.timestamp_ns
                 yield DataFrame(
                     features={
-                        "joints": self._joint_state(frame.joint_state),
-                        "actions": self._joint_state(frame.joint_command),
+                        # The source finger commands encode the current
+                        # end-effector state, so the synchronized value is
+                        # present in both observation and action columns.
+                        "joints": self._joint_state(
+                            frame.joint_state,
+                            frame.right_finger_command,
+                            frame.left_finger_command,
+                        ),
+                        "actions": self._joint_state(
+                            frame.joint_command,
+                            frame.right_finger_command,
+                            frame.left_finger_command,
+                        ),
                         "head": self._camera(frame.color, format_name="jpeg"),
                         "head_depth": self._camera(
                             frame.depth, format_name="png"
@@ -815,6 +960,8 @@ class _HcTjEpisodePackaging(EpisodePackaging):
             self.source.depths.clear()
             self.source.joint_states.clear()
             self.source.joint_commands.clear()
+            self.source.right_finger_commands.clear()
+            self.source.left_finger_commands.clear()
 
 
 def _dataset_features() -> hg_datasets.Features:
@@ -894,6 +1041,9 @@ def _episode_report(
         "joint_command_zero_tail_messages": (
             parsed.command_zero_tail_messages
         ),
+        "finger_command_trimmed_tail_messages": (
+            parsed.finger_trimmed_tail_messages
+        ),
         "frames": frame_report,
     }
 
@@ -957,6 +1107,10 @@ def convert_hc_tj_mcap(
     force_overwrite: bool = False,
 ) -> dict[str, Any]:
     """Convert hc_tj MCAP files into one multi-episode HoloBrain RODataset.
+
+    The ``joints`` and ``actions`` columns use a 16-axis per-arm layout:
+    ``Joint1_R..Joint7_R, R_ban, Joint1_L..Joint7_L, L_ban``. The two
+    ``*_ban`` positions are synchronized binary end-effector states.
 
     Args:
         input_path: A source MCAP, a recursively searched directory, or a

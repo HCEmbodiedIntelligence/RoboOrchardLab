@@ -26,18 +26,27 @@ import pytest
 pytest.importorskip("rosbags")
 
 from projects.holobrain.scripts.convert_hc_tj_mcap import (
-    ARM_JOINT_NAMES,
     CALIBRATION_TOPIC,
     COLOR_TOPIC,
     DEPTH_TOPIC,
     EXPECTED_SOURCE_JOINT_NAMES,
     EXTRINSICS_TOPIC,
+    HOLOBRAIN_JOINT_NAMES,
     JOINT_COMMAND_TOPIC,
     JOINT_STATE_TOPIC,
+    LEFT_FINGER_COMMAND_TOPIC,
     MCAP_MAGIC,
+    RIGHT_FINGER_COMMAND_TOPIC,
     _deserialize_message,
     _readable_mcap_path,
     convert_hc_tj_mcap,
+)
+from projects.holobrain.scripts.replay_hc_tj_mcap_urdf import (
+    FINGER_MAX_POSITION_RAD,
+    FINGER_MIN_POSITION_RAD,
+    TORSO_JOINT_CONFIG,
+    _load_joint_samples,
+    _source_joint_config,
 )
 from robo_orchard_lab.dataset.robot import RODataset
 from robo_orchard_lab.dataset.robot.db_orm import Episode
@@ -105,6 +114,8 @@ def _write_synthetic_mcap(path: Path) -> Path:
                 DEPTH_TOPIC: "sensor_msgs/msg/CompressedImage",
                 JOINT_STATE_TOPIC: "sensor_msgs/msg/JointState",
                 JOINT_COMMAND_TOPIC: "sensor_msgs/msg/JointState",
+                RIGHT_FINGER_COMMAND_TOPIC: "sensor_msgs/msg/JointState",
+                LEFT_FINGER_COMMAND_TOPIC: "sensor_msgs/msg/JointState",
                 CALIBRATION_TOPIC: "std_msgs/msg/String",
                 EXTRINSICS_TOPIC: "std_msgs/msg/String",
             }.items()
@@ -167,6 +178,28 @@ def _write_synthetic_mcap(path: Path) -> Path:
                 timestamp_ns + 3_000_000,
                 zero_tail=True,
             )
+            write(
+                RIGHT_FINGER_COMMAND_TOPIC,
+                joint_type(
+                    header=header,
+                    name=["R_ban"],
+                    position=np.asarray([index % 2], dtype=np.float64),
+                    velocity=np.asarray([], dtype=np.float64),
+                    effort=np.asarray([], dtype=np.float64),
+                ),
+                timestamp_ns + 4_000_000,
+            )
+            write(
+                LEFT_FINGER_COMMAND_TOPIC,
+                joint_type(
+                    header=header,
+                    name=["L_ban"],
+                    position=np.asarray([1 - index % 2], dtype=np.float64),
+                    velocity=np.asarray([], dtype=np.float64),
+                    effort=np.asarray([], dtype=np.float64),
+                ),
+                timestamp_ns + 4_000_000,
+            )
     return path / f"{path.name}.mcap"
 
 
@@ -208,6 +241,15 @@ def test_zero_tail_compatibility_is_exact() -> None:
         b"payload" + bytes(8),
         "sensor_msgs/msg/JointState",
         allow_zero_tail=True,
+    )
+    assert message == "sensor_msgs/msg/JointState"
+    assert trimmed is True
+    message, trimmed = _deserialize_message(
+        store,
+        b"payloadtaildata",
+        "sensor_msgs/msg/JointState",
+        allow_zero_tail=False,
+        allow_eight_byte_tail=True,
     )
     assert message == "sensor_msgs/msg/JointState"
     assert trimmed is True
@@ -254,6 +296,7 @@ def test_synthetic_mcap_converts_to_ro_dataset(tmp_path: Path) -> None:
     assert report["frames"]["candidate_rgb_frames"] == 2
     assert report["frames"]["output_frames"] == 2
     assert report["joint_command_zero_tail_messages"] == 2
+    assert report["finger_command_trimmed_tail_messages"] == 0
     assert mcap_path.read_bytes() == source_digest
     assert {
         "state.json",
@@ -265,8 +308,37 @@ def test_synthetic_mcap_converts_to_ro_dataset(tmp_path: Path) -> None:
     dataset = RODataset(str(output))
     assert len(dataset) == 2
     frame = dataset[0]
-    assert frame["joints"].names == list(ARM_JOINT_NAMES)
-    assert tuple(frame["joints"].position.shape) == (1, 14)
+    assert frame["joints"].names == list(HOLOBRAIN_JOINT_NAMES)
+    assert tuple(frame["joints"].position.shape) == (1, 16)
+    np.testing.assert_array_equal(
+        frame["joints"].position.numpy()[0, [7, 15]], [0, 1]
+    )
+    np.testing.assert_array_equal(
+        frame["actions"].position.numpy()[0, [7, 15]], [0, 1]
+    )
+    np.testing.assert_array_equal(
+        frame["joints"].velocity.numpy()[0, [7, 15]], [0, 0]
+    )
+    replay_actions, replay_joints, episode_count = _load_joint_samples(
+        output, episode_index=0
+    )
+    assert episode_count == 1
+    assert len(replay_actions) == len(replay_joints) == 2
+    replay_config = _source_joint_config(replay_actions[0])
+    assert replay_config["R_ban"] == FINGER_MAX_POSITION_RAD
+    assert replay_config["L_ban"] == FINGER_MIN_POSITION_RAD
+    assert all(
+        replay_config[name] == value
+        for name, value in TORSO_JOINT_CONFIG.items()
+    )
+    assert report["messages"][RIGHT_FINGER_COMMAND_TOPIC] == 2
+    assert report["messages"][LEFT_FINGER_COMMAND_TOPIC] == 2
+    assert (
+        report["frames"]["nearest_neighbor_error_ms"]["right_finger_command"][
+            "tolerance"
+        ]
+        == 150.0
+    )
     assert frame["head"].frame_id == "eye"
     assert frame["head"].pose.parent_frame_id == "zhi_Link"
     assert frame["head"].pose.child_frame_id == "eye"

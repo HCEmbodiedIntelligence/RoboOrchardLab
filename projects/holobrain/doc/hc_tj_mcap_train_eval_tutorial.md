@@ -24,9 +24,10 @@ RODataset，启动训练，再用训练得到的 checkpoint 对指定 episode �
 ## 1. 数据约定
 
 - 一个 MCAP 文件对应一个 episode。
-- 状态来自 `joint_states`，监督动作来自 `joint_cmd`。
-- 只保留双臂 14 轴，顺序为右臂 `Joint1_R..Joint7_R`，再到左臂
-  `Joint1_L..Joint7_L`。
+- 手臂状态来自 `joint_states`，监督动作来自 `joint_cmd`；左右末端开合状态
+  分别来自 `joint_cmd_finger_right` 和 `joint_cmd_finger_left`。
+- 保留双臂与末端共 16 维，顺序为右臂 `Joint1_R..Joint7_R, R_ban`，
+  再到左臂 `Joint1_L..Joint7_L, L_ban`；末端值 0 表示打开，1 表示闭合。
 - 训练相机只有头部相机 `head`，包含 RGB 和对齐深度。
 - 双臂 FK、相机外参和投影统一使用 `zhi_Link` 参考坐标系。
 - 必须使用 hc_tj 自身的 URDF，不能替换成 Agilex 或其他机器人的 URDF。
@@ -85,7 +86,8 @@ python scripts/convert_hc_tj_mcap.py \
 
 - 深度 50 ms；
 - `joint_states` 20 ms；
-- `joint_cmd` 20 ms。
+- `joint_cmd` 20 ms；
+- 左右 `joint_cmd_finger_*` 150 ms。
 
 超限帧会被丢弃并记录在报告中。
 
@@ -162,8 +164,9 @@ python scripts/train.py \
   }"
 ```
 
-这里的网络监督目标是未来 64 步、14 维的绝对目标关节角，不是头部相机坐标系下
-的末端位姿变化量。模型内部会按 hc_tj URDF 做 FK，用于几何特征和 FK loss。
+这里的网络监督目标是未来 64 步、16 维的双臂绝对目标关节角与二值末端状态，
+不是头部相机坐标系下的末端位姿变化量。模型内部会按 hc_tj URDF 做 FK，
+用于几何特征和 FK loss。
 
 训练 checkpoint 目录中会包含 `model.safetensors`。离线评测需要传入这个文件，
 而不是 checkpoint 目录：

@@ -14,24 +14,24 @@
 # implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
-"""Replay HC-TJ MCAP arm joints through the local URDF.
+"""Replay a converted HC-TJ RODataset through the local URDF.
 
-Use ``--source command`` or ``--source state`` to inspect either teleoperation
-commands or measured states. Both topics are always decoded and summarized.
+The converted ``joints`` and ``actions`` columns both use HoloBrain's 16-axis
+ordering: ``Joint1_R..Joint7_R, R_ban, Joint1_L..Joint7_L, L_ban``. Finger
+values are binary commands: 0 drives the URDF finger joint to its maximum
+position (1.5707 rad), while 1 drives it to its minimum position (0 rad).
 
-# example usage
-```bash
-python own_test/replay_hc_tj_mcap_urdf.py  \
-/home/hc-em/workspace/workspaces/RoboOrchardLab/own_test/dataset_mcap/hc_tj_data_0812/hc_tj_description_2608
-12_134826_0.mcap   \
---urdf /data/workspaces/RoboOrchardLab/hc_assets/hc_tj_description/urdf/hc_tj_robot.urdf  \
---source state  \
---loop
-```
+Example:
+
+.. code-block:: bash
+
+   conda run -n holobrain python \
+     projects/holobrain/scripts/replay_hc_tj_mcap_urdf.py \
+     projects/holobrain/data/arrow_dataset/hc_tj_260818_fix \
+     --episode-index 0 --source actions --loop
 """
 
 from __future__ import annotations
-
 import argparse
 import bisect
 import time
@@ -43,39 +43,55 @@ import numpy as np
 
 __all__ = ["main"]
 
-JOINT_STATE_TOPIC = "io_teleop/joint_states"
-JOINT_COMMAND_TOPIC = "io_teleop/joint_cmd"
-ARM_JOINT_NAMES = tuple(
-    [f"Joint{index}_R" for index in range(1, 8)]
-    + [f"Joint{index}_L" for index in range(1, 8)]
+RIGHT_ARM_JOINT_NAMES = tuple(f"Joint{index}_R" for index in range(1, 8))
+LEFT_ARM_JOINT_NAMES = tuple(f"Joint{index}_L" for index in range(1, 8))
+HOLOBRAIN_JOINT_NAMES = (
+    RIGHT_ARM_JOINT_NAMES + ("R_ban",) + LEFT_ARM_JOINT_NAMES + ("L_ban",)
 )
-EXPECTED_SOURCE_JOINT_NAMES = ARM_JOINT_NAMES + ("leg_1", "leg_2", "zhi")
-TORSO_JOINT_NAMES = ("leg_1", "leg_2", "zhi")
+FINGER_INDICES = (7, 15)
+FINGER_JOINT_NAMES = ("R_ban", "L_ban")
+FINGER_MIN_POSITION_RAD = 0.0
+FINGER_MAX_POSITION_RAD = 1.5707
+TORSO_JOINT_CONFIG = {
+    "leg_1": 0.0884089146881689,
+    "leg_2": 0.18213798336727732,
+    "zhi": 0.7343025305957696,
+}
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_DATASET_PATH = (
+    REPOSITORY_ROOT / "projects/holobrain/data/arrow_dataset/hc_tj_260818_fix"
+)
 DEFAULT_URDF_PATH = (
-    Path(__file__).resolve().parents[3]
-    / "hc_assets/hc_tj_description/urdf/hc_tj_robot.urdf"
+    REPOSITORY_ROOT / "hc_assets/hc_tj_description/urdf/hc_tj_robot.urdf"
 )
 
 
 @dataclass(frozen=True, slots=True)
 class JointSample:
-    """One 17-DoF arm-and-torso sample from a ROS JointState message."""
+    """One 16-axis arm-and-gripper sample from a converted Arrow row."""
 
     timestamp_ns: int
     position: np.ndarray
 
 
 def main() -> None:
-    """Parse arguments, validate samples, and optionally render a replay."""
+    """Parse arguments, validate one dataset episode, and render its replay."""
     args = _parse_args()
-    mcap_path = _resolve_mcap_path(args.mcap)
-    command_samples, state_samples = _load_joint_samples(mcap_path)
-    _print_summary(mcap_path, command_samples, state_samples)
+    dataset_path = _resolve_dataset_path(args.dataset)
+    actions, joints, episode_count = _load_joint_samples(
+        dataset_path, args.episode_index
+    )
+    _print_summary(
+        dataset_path,
+        actions,
+        joints,
+        episode_index=args.episode_index,
+        episode_count=episode_count,
+    )
     if args.no_gui:
         return
     _replay(
-        command_samples,
-        state_samples,
+        actions if args.source == "actions" else joints,
         urdf_path=args.urdf,
         playback_rate=args.playback_rate,
         loop=args.loop,
@@ -84,12 +100,20 @@ def main() -> None:
 
 
 def _parse_args() -> argparse.Namespace:
-    """Return CLI arguments for one MCAP replay session."""
+    """Return CLI arguments for one converted-dataset replay session."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "mcap",
+        "dataset",
         type=Path,
-        help="An HC-TJ .mcap file, or a directory containing exactly one to replay.",
+        nargs="?",
+        default=DEFAULT_DATASET_PATH,
+        help=f"Converted HC-TJ RODataset (default: {DEFAULT_DATASET_PATH}).",
+    )
+    parser.add_argument(
+        "--episode-index",
+        type=int,
+        default=0,
+        help="Episode metadata index to replay (default: 0).",
     )
     parser.add_argument(
         "--urdf",
@@ -106,20 +130,25 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--loop",
         action="store_true",
-        help="Replay repeatedly until the viewer is closed or Ctrl+C is pressed.",
+        help=(
+            "Replay repeatedly until the viewer is closed or Ctrl+C is "
+            "pressed."
+        ),
     )
     parser.add_argument(
         "--source",
-        choices=("command", "state"),
-        default="command",
-        help="Joint topic to drive the rendered robot (default: command).",
+        choices=("actions", "joints"),
+        default="actions",
+        help="Arrow column used to drive the robot (default: actions).",
     )
     parser.add_argument(
         "--no-gui",
         action="store_true",
-        help="Only decode and print a summary; useful on headless machines.",
+        help="Only load, validate, and summarize the selected episode.",
     )
     args = parser.parse_args()
+    if args.episode_index < 0:
+        parser.error("--episode-index must be non-negative")
     if args.playback_rate <= 0:
         parser.error("--playback-rate must be positive")
     if not args.urdf.is_file():
@@ -127,123 +156,130 @@ def _parse_args() -> argparse.Namespace:
     return args
 
 
-def _resolve_mcap_path(path: Path) -> Path:
-    """Resolve one input MCAP file and reject ambiguous directories."""
-    if path.is_file() and path.suffix == ".mcap":
-        return path
-    if path.is_dir():
-        files = sorted(path.glob("*.mcap"))
-        if len(files) == 1:
-            return files[0]
-        if not files:
-            raise FileNotFoundError(f"No .mcap file found in {path}")
+def _resolve_dataset_path(path: Path) -> Path:
+    """Resolve a converted RODataset directory and validate its core files."""
+    path = path.expanduser().resolve()
+    if not path.is_dir():
+        raise FileNotFoundError(f"RODataset directory does not exist: {path}")
+    missing = [
+        name
+        for name in ("state.json", "dataset_info.json")
+        if not (path / name).is_file()
+    ]
+    if missing:
         raise ValueError(
-            f"{path} contains {len(files)} MCAP files; pass the one to replay"
+            f"{path} is not a converted RODataset; missing files: {missing}"
         )
-    raise FileNotFoundError(f"MCAP file does not exist: {path}")
+    return path
 
 
-def _load_joint_samples(mcap_path: Path) -> tuple[list[JointSample], list[JointSample]]:
-    """Load command and measured arm samples from the two required topics."""
+def _load_joint_samples(
+    dataset_path: Path, episode_index: int
+) -> tuple[list[JointSample], list[JointSample], int]:
+    """Load ``actions`` and ``joints`` from one episode of a RODataset."""
     try:
-        from rosbags.highlevel import AnyReader
-        from rosbags.typesys import Stores, get_typestore
+        from robo_orchard_lab.dataset.robot import RODataset
+        from robo_orchard_lab.dataset.robot.db_orm import Episode
     except ImportError as error:
         raise RuntimeError(
-            "rosbags is required; run this script in the holobrain conda environment"
+            "RoboOrchard dataset dependencies are required; run this script "
+            "in the holobrain conda environment"
         ) from error
 
-    typestore = get_typestore(Stores.ROS2_HUMBLE)
-    samples_by_topic = {JOINT_COMMAND_TOPIC: [], JOINT_STATE_TOPIC: []}
-    with AnyReader([mcap_path]) as reader:
-        connections = [
-            connection
-            for connection in reader.connections
-            if connection.topic in samples_by_topic
-        ]
-        found_topics = {connection.topic for connection in connections}
-        missing_topics = set(samples_by_topic) - found_topics
-        if missing_topics:
-            raise ValueError(f"Required MCAP topics are missing: {sorted(missing_topics)}")
-        for connection, log_time_ns, raw in reader.messages(connections=connections):
-            message = _deserialize_joint_state(
-                typestore, raw, connection.msgtype, connection.topic
-            )
-            samples_by_topic[connection.topic].append(
-                _to_joint_sample(message, log_time_ns, connection.topic)
-            )
-
-    command_samples = samples_by_topic[JOINT_COMMAND_TOPIC]
-    state_samples = samples_by_topic[JOINT_STATE_TOPIC]
-    if not command_samples or not state_samples:
-        raise ValueError("Both joint topics must contain at least one message")
-    command_samples.sort(key=lambda sample: sample.timestamp_ns)
-    state_samples.sort(key=lambda sample: sample.timestamp_ns)
-    return command_samples, state_samples
-
-
-def _deserialize_joint_state(
-    typestore: Any, raw: bytes | memoryview, msgtype: str, topic: str
-) -> Any:
-    """Deserialize a JointState, allowing HC-TJ command's known zero tail."""
-    normalized_msgtype = _normalize_msgtype(msgtype)
-    raw_bytes = bytes(raw)
-    try:
-        return typestore.deserialize_cdr(raw_bytes, normalized_msgtype)
-    except Exception as original_error:
-        if topic != JOINT_COMMAND_TOPIC or raw_bytes[-8:] != bytes(8):
-            raise ValueError(f"Failed to deserialize {topic} as {msgtype}") from original_error
-        try:
-            return typestore.deserialize_cdr(raw_bytes[:-8], normalized_msgtype)
-        except Exception as trimmed_error:
-            raise ValueError(f"Failed to deserialize {topic} after zero-tail removal") from trimmed_error
-
-
-def _normalize_msgtype(msgtype: str) -> str:
-    """Normalize ROS 2 aliases stored in this MCAP's connection metadata."""
-    package, separator, type_name = msgtype.partition("/")
-    if "/msg/" in msgtype or not separator:
-        return msgtype
-    return f"{package}/msg/{type_name}"
-
-
-def _to_joint_sample(message: Any, log_time_ns: int, topic: str) -> JointSample:
-    """Validate JointState ordering and retain arm plus torso positions."""
-    names = tuple(message.name)
-    if names != EXPECTED_SOURCE_JOINT_NAMES:
+    dataset = RODataset(str(dataset_path))
+    episodes = list(dataset.iterate_meta(Episode))
+    episode = next(
+        (item for item in episodes if item.index == episode_index), None
+    )
+    if episode is None:
+        available = [item.index for item in episodes]
         raise ValueError(
-            f"{topic} joint order mismatch: expected {list(EXPECTED_SOURCE_JOINT_NAMES)}, "
-            f"got {list(names)}"
+            f"Episode index {episode_index} is unavailable; available "
+            "indices: "
+            f"{available}"
         )
-    position = np.asarray(message.position, dtype=np.float64)
-    if position.shape != (len(EXPECTED_SOURCE_JOINT_NAMES),) or not np.all(
+    begin = episode.dataset_begin_index
+    end = begin + episode.frame_num
+    if begin < 0 or episode.frame_num <= 0 or end > len(dataset):
+        raise ValueError(
+            f"Episode {episode_index} has invalid frame range "
+            f"[{begin}, {end}) "
+            f"for dataset length {len(dataset)}"
+        )
+
+    actions: list[JointSample] = []
+    joints: list[JointSample] = []
+    for row_index in range(begin, end):
+        row = dataset[row_index]
+        if row["episode_index"] != episode_index:
+            raise ValueError(
+                f"Dataset row {row_index} belongs to episode "
+                f"{row['episode_index']}, expected {episode_index}"
+            )
+        actions.append(_to_joint_sample(row["actions"], "actions", row_index))
+        joints.append(_to_joint_sample(row["joints"], "joints", row_index))
+    actions.sort(key=lambda sample: sample.timestamp_ns)
+    joints.sort(key=lambda sample: sample.timestamp_ns)
+    return actions, joints, len(episodes)
+
+
+def _to_joint_sample(state: Any, column: str, row_index: int) -> JointSample:
+    """Validate and decode one 16-axis ``BatchJointsState`` value."""
+    names = tuple(state.names)
+    if names != HOLOBRAIN_JOINT_NAMES:
+        raise ValueError(
+            f"Row {row_index} {column} joint order mismatch: expected "
+            f"{list(HOLOBRAIN_JOINT_NAMES)}, got {list(names)}"
+        )
+    position = np.asarray(state.position, dtype=np.float64)
+    if position.shape != (1, len(HOLOBRAIN_JOINT_NAMES)) or not np.all(
         np.isfinite(position)
     ):
-        raise ValueError(f"{topic} position must contain 17 finite joint values")
-    stamp = getattr(getattr(message, "header", None), "stamp", None)
-    timestamp_ns = (
-        int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec) if stamp else 0
-    )
-    return JointSample(timestamp_ns if timestamp_ns > 0 else int(log_time_ns), position)
+        raise ValueError(
+            f"Row {row_index} {column} position must have shape "
+            f"(1, {len(HOLOBRAIN_JOINT_NAMES)}) with finite values"
+        )
+    finger_values = position[0, list(FINGER_INDICES)]
+    if not np.all(np.isin(finger_values, (0.0, 1.0))):
+        raise ValueError(
+            f"Row {row_index} {column} finger values must be binary, got "
+            f"{finger_values.tolist()}"
+        )
+    if len(state.timestamps) != 1 or int(state.timestamps[0]) <= 0:
+        raise ValueError(
+            f"Row {row_index} {column} must contain one positive timestamp"
+        )
+    return JointSample(int(state.timestamps[0]), position[0].copy())
 
 
 def _print_summary(
-    mcap_path: Path, command_samples: Sequence[JointSample], state_samples: Sequence[JointSample]
+    dataset_path: Path,
+    actions: Sequence[JointSample],
+    joints: Sequence[JointSample],
+    *,
+    episode_index: int,
+    episode_count: int,
 ) -> None:
-    """Print the decoded recording range and an initial command/state error."""
-    state_at_start = _nearest_sample(state_samples, command_samples[0].timestamp_ns)
-    first_error = command_samples[0].position - state_at_start.position
-    duration_s = (command_samples[-1].timestamp_ns - command_samples[0].timestamp_ns) / 1e9
-    print(f"MCAP: {mcap_path}")
-    print(f"joint_cmd samples: {len(command_samples)}")
-    print(f"joint_states samples: {len(state_samples)}")
-    print(f"command duration: {duration_s:.3f} s")
-    print(f"initial max |command - state|: {np.max(np.abs(first_error)):.4f} rad")
-    print("arm order:", ", ".join(ARM_JOINT_NAMES))
-    print("torso order: leg_1, leg_2, zhi")
+    """Print the selected episode range and initial action/state difference."""
+    joint_at_start = _nearest_sample(joints, actions[0].timestamp_ns)
+    first_error = actions[0].position - joint_at_start.position
+    duration_s = (actions[-1].timestamp_ns - actions[0].timestamp_ns) / 1e9
+    print(f"RODataset: {dataset_path}")
+    print(f"episode: {episode_index} of {episode_count}")
+    print(f"actions samples: {len(actions)}")
+    print(f"joints samples: {len(joints)}")
+    print(f"actions duration: {duration_s:.3f} s")
+    print(f"initial max |actions - joints|: {np.max(np.abs(first_error)):.4f}")
+    print(
+        "initial fingers (R_ban, L_ban):",
+        tuple(actions[0].position[index] for index in FINGER_INDICES),
+    )
+    print("joint order:", ", ".join(HOLOBRAIN_JOINT_NAMES))
 
 
-def _nearest_sample(samples: Sequence[JointSample], timestamp_ns: int) -> JointSample:
+def _nearest_sample(
+    samples: Sequence[JointSample], timestamp_ns: int
+) -> JointSample:
     """Return the sample nearest to a target timestamp."""
     timestamps = [sample.timestamp_ns for sample in samples]
     index = bisect.bisect_left(timestamps, timestamp_ns)
@@ -252,37 +288,44 @@ def _nearest_sample(samples: Sequence[JointSample], timestamp_ns: int) -> JointS
     if index == len(samples):
         return samples[-1]
     before, after = samples[index - 1], samples[index]
-    return before if timestamp_ns - before.timestamp_ns <= after.timestamp_ns - timestamp_ns else after
+    return (
+        before
+        if timestamp_ns - before.timestamp_ns
+        <= after.timestamp_ns - timestamp_ns
+        else after
+    )
 
 
 def _replay(
-    command_samples: Sequence[JointSample],
-    state_samples: Sequence[JointSample],
+    samples: Sequence[JointSample],
     *,
     urdf_path: Path,
     playback_rate: float,
     loop: bool,
     source: str,
 ) -> None:
-    """Render the selected source in the HC-TJ URDF viewer."""
+    """Render one selected Arrow column in the HC-TJ URDF viewer."""
     try:
         from yourdfpy import URDF
     except ImportError as error:
         raise RuntimeError(
-            "yourdfpy is required; run this script in the holobrain conda environment"
+            "yourdfpy is required; run this script in the holobrain conda "
+            "environment"
         ) from error
 
-    samples = command_samples if source == "command" else state_samples
     robot = URDF.load(str(urdf_path), build_scene_graph=True)
     _validate_urdf_joints(robot.actuated_joint_names)
     start_ns = samples[0].timestamp_ns
     duration_ns = max(samples[-1].timestamp_ns - start_ns, 1)
     wall_start = time.monotonic()
+    print(f"Opening HC-TJ viewer driven by '{source}'; close it to exit.")
 
     def update_scene(_: Any) -> None:
         """Advance the selected stream from elapsed viewer time."""
         elapsed_ns = int((time.monotonic() - wall_start) * playback_rate * 1e9)
-        elapsed_ns = elapsed_ns % duration_ns if loop else min(elapsed_ns, duration_ns)
+        elapsed_ns = (
+            elapsed_ns % duration_ns if loop else min(elapsed_ns, duration_ns)
+        )
         sample = _nearest_sample(samples, start_ns + elapsed_ns)
         robot.update_cfg(_source_joint_config(sample))
 
@@ -298,23 +341,29 @@ def _replay(
 
 
 def _source_joint_config(sample: JointSample) -> dict[str, float]:
-    """Map one MCAP sample to URDF joint values.
+    """Map arm positions and binary finger commands to HC-TJ URDF values.
 
-    The MCAP torso encoder direction is opposite to the HC-TJ URDF convention:
-    its three torso joint axes are all defined as negative Y in the URDF.
-    Arm values already use the URDF convention and are kept unchanged.
+    The stored command convention is inverted relative to the URDF joint
+    coordinate: ``0`` maps to the upper limit and ``1`` maps to the lower
+    limit for both ``R_ban`` and ``L_ban``.
     """
-    config = dict(zip(EXPECTED_SOURCE_JOINT_NAMES, sample.position, strict=True))
-    for joint_name in TORSO_JOINT_NAMES:
-        config[joint_name] = config[joint_name]
+    config = dict(zip(HOLOBRAIN_JOINT_NAMES, sample.position, strict=True))
+    for joint_name in FINGER_JOINT_NAMES:
+        config[joint_name] = (
+            FINGER_MAX_POSITION_RAD
+            if config[joint_name] == 0.0
+            else FINGER_MIN_POSITION_RAD
+        )
+    config.update(TORSO_JOINT_CONFIG)
     return config
 
 
 def _validate_urdf_joints(actuated_joint_names: Iterable[str]) -> None:
-    """Ensure every arm and torso joint from the recording exists in the URDF."""
-    missing = set(EXPECTED_SOURCE_JOINT_NAMES) - set(actuated_joint_names)
+    """Ensure all replayed arm, gripper, and fixed torso joints exist."""
+    expected = set(HOLOBRAIN_JOINT_NAMES) | set(TORSO_JOINT_CONFIG)
+    missing = expected - set(actuated_joint_names)
     if missing:
-        raise ValueError(f"URDF is missing source joints: {sorted(missing)}")
+        raise ValueError(f"URDF is missing replay joints: {sorted(missing)}")
 
 
 if __name__ == "__main__":
