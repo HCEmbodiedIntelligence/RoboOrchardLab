@@ -19,7 +19,9 @@ import json
 import logging
 import os
 import sys
+import time
 from io import BytesIO
+from threading import Lock
 from typing import Any
 
 _REPO_ROOT = os.path.abspath(
@@ -38,6 +40,13 @@ from robo_orchard_core.utils.cli import (  # noqa: E402
 )
 from robo_orchard_core.utils.logging import LoggerManager  # noqa: E402
 
+from projects.holobrain.scripts.hc_tj_async_core import (  # noqa: E402
+    ACTION_HORIZON,
+    ACTION_HZ,
+    HC_TJ_JOINT_NAMES,
+    ProtocolError,
+    validate_inference_request,
+)
 from robo_orchard_lab.models.holobrain.pipeline import (  # noqa: E402
     HoloBrainInferencePipeline,
 )
@@ -92,13 +101,131 @@ pipeline.model.eval()
 logger.info(f"Model server {args.server_name} started on port {args.port}")
 
 app = Flask(__name__)
+_pipeline_lock = Lock()
 
 
-def _load_npy(
-    request_data: dict[str, Any], name: str, dtype 
-) -> np.ndarray:
+def _load_npy(request_data: dict[str, Any], name: str, dtype) -> np.ndarray:
     """Load one multipart ``.npy`` field with an explicit dtype."""
     return np.load(BytesIO(request_data[name].read())).astype(dtype)
+
+
+def _load_npy_wire(request_data: dict[str, Any], name: str) -> np.ndarray:
+    """Load one v1 wire array without dtype coercion or pickle support."""
+    try:
+        return np.load(BytesIO(request_data[name].read()), allow_pickle=False)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ProtocolError(f"{name} must be a valid .npy upload") from error
+
+
+def _decode_hc_tj_async_request(
+    request_data: dict[str, Any],
+) -> MultiArmManipulationInput:
+    """Decode the strict model-native 16-axis HC-TJ v1 protocol."""
+    required = (
+        "head_color",
+        "head_depth",
+        "head_intrinsic",
+        "zhi_to_eye",
+        "current_state",
+        "joint_names",
+        "instruction",
+    )
+    missing = [name for name in required if name not in request_data]
+    if missing:
+        raise ProtocolError(f"missing required fields: {missing}")
+    try:
+        joint_names = json.loads(request_data["joint_names"])
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ProtocolError(
+            "joint_names must be a JSON string array"
+        ) from error
+    if not isinstance(joint_names, list) or not all(
+        isinstance(name, str) for name in joint_names
+    ):
+        raise ProtocolError("joint_names must be a JSON string array")
+
+    remaining = (
+        _load_npy_wire(request_data, "remaining_actions")
+        if "remaining_actions" in request_data
+        else None
+    )
+    raw_delay = request_data.get("delay_horizon")
+    try:
+        delay_horizon = int(raw_delay) if raw_delay is not None else None
+    except (TypeError, ValueError) as error:
+        raise ProtocolError("delay_horizon must be an integer") from error
+    if raw_delay is not None and str(delay_horizon) != str(raw_delay):
+        raise ProtocolError("delay_horizon must be an integer")
+
+    validated = validate_inference_request(
+        head_color=_load_npy_wire(request_data, "head_color"),
+        head_depth=_load_npy_wire(request_data, "head_depth"),
+        head_intrinsic_mat=_load_npy_wire(request_data, "head_intrinsic"),
+        zhi_to_eye_mat=_load_npy_wire(request_data, "zhi_to_eye"),
+        current_state=_load_npy_wire(request_data, "current_state"),
+        joint_names=joint_names,
+        instruction=request_data["instruction"],
+        remaining_actions=remaining,
+        delay_horizon=delay_horizon,
+    )
+    return MultiArmManipulationInput(
+        image={"head": [validated.head_color]},
+        depth={"head": [validated.head_depth]},
+        history_joint_state=[validated.current_state],
+        intrinsic={"head": validated.head_intrinsic_mat},
+        t_world2cam={"head": validated.zhi_to_eye_mat},
+        instruction=validated.instruction,
+        remaining_actions=validated.remaining_actions,
+        delay_horizon=validated.delay_horizon,
+    )
+
+
+def _pipeline_has_rtc() -> bool:
+    """Return whether the loaded decoder owns the RTC plugin."""
+    model = pipeline.model
+    if hasattr(model, "module"):
+        model = model.module
+    decoder = getattr(model, "decoder", None)
+    plugin = getattr(decoder, "async_inference_plugin", None)
+    plugin_type = type(plugin)
+    return (
+        plugin_type.__name__ == "RTCInferencePlugin"
+        and plugin_type.__module__
+        == "robo_orchard_lab.models.rtc_plugin.rtc_plugin"
+    )
+
+
+def _infer_hc_tj_async(request_data: dict[str, Any]) -> dict[str, Any]:
+    """Run one serialized v1 inference and return native 30 Hz actions."""
+    model_input = _decode_hc_tj_async_request(request_data)
+    if model_input.remaining_actions is not None and not _pipeline_has_rtc():
+        raise ProtocolError(
+            "remaining_actions requires the loaded model to configure "
+            "RTCInferencePlugin"
+        )
+    start_time = time.perf_counter()
+    with _pipeline_lock, torch.inference_mode():
+        output = pipeline(model_input)
+    inference_ms = (time.perf_counter() - start_time) * 1000
+    actions = torch.as_tensor(output.action).detach().cpu().numpy()
+    if (
+        actions.ndim != 2
+        or actions.shape[1] != len(HC_TJ_JOINT_NAMES)
+        or not 0 < len(actions) <= ACTION_HORIZON
+        or not np.all(np.isfinite(actions))
+    ):
+        raise RuntimeError(
+            "pipeline returned invalid HC-TJ actions; expected finite "
+            "[1..64,16], "
+            f"got {actions.shape}"
+        )
+    return {
+        "actions": actions.astype(np.float32).tolist(),
+        "joint_names": list(HC_TJ_JOINT_NAMES),
+        "action_hz": ACTION_HZ,
+        "action_horizon": len(actions),
+        "inference_ms": inference_ms,
+    }
 
 
 def _decode_hc_tj_request(
@@ -236,7 +363,8 @@ def decode_request(request_data: dict[str, Any]) -> MultiArmManipulationInput:
 def infer(request_data):
     try:
         model_input = decode_request(request_data)
-        output = pipeline(model_input)
+        with _pipeline_lock:
+            output = pipeline(model_input)
         actions = output.action
 
         actions = torch.nn.functional.interpolate(
@@ -306,6 +434,20 @@ def model_infer():
     except Exception as e:
         logging.error(f"Error in endpoint: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route(f"/{args.server_name}/hc_tj_async/v1", methods=["POST"])
+def hc_tj_async_model_infer():
+    """Serve the strict HC-TJ 30 Hz, 16-axis asynchronous protocol."""
+    try:
+        data = {**request.files, **request.form}
+        return jsonify(_infer_hc_tj_async(data))
+    except ProtocolError as error:
+        logger.warning("Rejected HC-TJ asynchronous request: %s", error)
+        return jsonify({"error": str(error), "error_type": "protocol"}), 400
+    except Exception as error:
+        logger.exception("HC-TJ asynchronous inference failed")
+        return jsonify({"error": str(error), "error_type": "inference"}), 500
 
 
 if __name__ == "__main__":

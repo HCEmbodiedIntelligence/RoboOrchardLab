@@ -14,10 +14,10 @@
 # implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
-"""RODataset reader for the hc_tj 16-axis dual-arm embodiment."""
+"""RODataset reader for 14-axis and 16-axis hc_tj dual-arm embodiments."""
 
 from __future__ import annotations
-from typing import Callable
+from typing import Callable, Sequence
 
 import cv2
 import numpy as np
@@ -38,12 +38,12 @@ __all__ = ["HcTjRODataset"]
 _CAMERA_NAME = "head"
 _REFERENCE_FRAME = "zhi_Link"
 _CAMERA_FRAME = "eye"
-_JOINT_NAMES = [
+_DEFAULT_JOINT_NAMES = (
     *[f"Joint{i}_R" for i in range(1, 8)],
     "R_ban",
     *[f"Joint{i}_L" for i in range(1, 8)],
     "L_ban",
-]
+)
 
 
 class _HcTjArrowDataParse:
@@ -55,9 +55,16 @@ class _HcTjArrowDataParse:
     ``T_world2cam`` field, whose "world" is hc_tj's ``zhi_Link`` reference.
     """
 
-    def __init__(self, *, depth_scale: int, hist_steps: int) -> None:
+    def __init__(
+        self,
+        *,
+        depth_scale: int,
+        hist_steps: int,
+        joint_names: tuple[str, ...],
+    ) -> None:
         self.depth_scale = depth_scale
         self.hist_steps = hist_steps
+        self.joint_names = joint_names
 
     @staticmethod
     def _instruction(data: dict) -> str:
@@ -74,20 +81,19 @@ class _HcTjArrowDataParse:
             raise ValueError("hc_tj instruction description must be non-empty")
         return text
 
-    @staticmethod
-    def _joint_array(data: dict, column: str) -> np.ndarray:
+    def _joint_array(self, data: dict, column: str) -> np.ndarray:
         states = data[column]
         for state in states:
-            if state.names != _JOINT_NAMES:
+            if tuple(state.names) != self.joint_names:
                 raise ValueError(
                     f"hc_tj {column} joint order mismatch: {state.names}"
                 )
         values = np.stack([state.position for state in states])
         values = values.squeeze(1).astype(np.float64)
-        if values.ndim != 2 or values.shape[1] != len(_JOINT_NAMES):
+        if values.ndim != 2 or values.shape[1] != len(self.joint_names):
             raise ValueError(
                 f"hc_tj {column} must have shape "
-                f"(steps, {len(_JOINT_NAMES)}), got "
+                f"(steps, {len(self.joint_names)}), got "
                 f"{values.shape}"
             )
         return values
@@ -160,8 +166,9 @@ class HcTjRODataset(TorchDataset):
     """Read hc_tj RODatasets for HoloBrain training.
 
     This adapter is specific to the hc_tj embodiment: it materializes
-    RODataset metadata, samples 16-axis arm-and-gripper chunks, decodes the
-    single aligned head RGB/depth pair, and preserves ``zhi_Link`` as the
+    RODataset metadata, samples configured arm or arm-and-gripper chunks,
+    decodes the single aligned head RGB/depth pair, and preserves
+    ``zhi_Link`` as the
     camera and kinematics reference.
 
     Args:
@@ -170,6 +177,9 @@ class HcTjRODataset(TorchDataset):
         pred_steps: Number of future action rows per sample.
         depth_scale: Divisor converting uint16 depth values to meters.
         transforms: HoloBrain transforms applied after hc_tj row decoding.
+        joint_names: Ordered joint names expected in the ``joints`` and
+            ``actions`` columns. Defaults to the 16-axis arm-and-gripper
+            layout.
     """
 
     def __init__(
@@ -179,9 +189,13 @@ class HcTjRODataset(TorchDataset):
         pred_steps: int,
         depth_scale: int = 1000,
         transforms: list[Callable] | None = None,
+        joint_names: Sequence[str] = _DEFAULT_JOINT_NAMES,
     ) -> None:
         if not paths:
             raise ValueError("hc_tj dataset paths must not be empty")
+        joint_names = tuple(joint_names)
+        if not joint_names or len(set(joint_names)) != len(joint_names):
+            raise ValueError("hc_tj joint_names must be non-empty and unique")
         row_sampler = EpisodeChunkSamplerConfig(
             target_columns=["joints", "actions"],
             hist_steps=hist_steps,
@@ -200,6 +214,7 @@ class HcTjRODataset(TorchDataset):
                 _HcTjArrowDataParse(
                     depth_scale=depth_scale,
                     hist_steps=hist_steps,
+                    joint_names=joint_names,
                 ),
                 *(transforms or []),
             ]

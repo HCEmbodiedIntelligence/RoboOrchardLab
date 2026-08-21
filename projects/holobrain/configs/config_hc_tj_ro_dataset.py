@@ -43,13 +43,16 @@ _DATASET_PATH = (
     / "arrow_dataset"
     / "hc_tj_260818_fix"
 )
+_ARM_ONLY_DATASET_PATH = (
+    Path(__file__).resolve().parents[1] / "data" / "arrow_dataset" / "hc_tj"
+)
 _RIGHT_JOINT_NAMES = [f"Joint{i}_R" for i in range(1, 8)]
 _LEFT_JOINT_NAMES = [f"Joint{i}_L" for i in range(1, 8)]
 _ARM_JOINT_NAMES = _RIGHT_JOINT_NAMES + _LEFT_JOINT_NAMES
 _GRIPPER_SCALE_SHIFT = (0.5, 0.5)
 
 
-def _joint_scale_shift_from_urdf(urdf: Path) -> list[list[float]]:
+def _arm_joint_scale_shift_from_urdf(urdf: Path) -> list[list[float]]:
     root = ET.parse(urdf).getroot()
     limits: dict[str, tuple[float, float]] = {}
     for joint in root.findall("joint"):
@@ -67,10 +70,14 @@ def _joint_scale_shift_from_urdf(urdf: Path) -> list[list[float]]:
     missing = [name for name in _ARM_JOINT_NAMES if name not in limits]
     if missing:
         raise ValueError(f"hc_tj URDF is missing joint limits for {missing}")
-    arm_scale_shift = [
+    return [
         [(upper - lower) / 2, (upper + lower) / 2]
         for lower, upper in (limits[name] for name in _ARM_JOINT_NAMES)
     ]
+
+
+def _joint_scale_shift_from_urdf(urdf: Path) -> list[list[float]]:
+    arm_scale_shift = _arm_joint_scale_shift_from_urdf(urdf)
     return (
         arm_scale_shift[:7]
         + [list(_GRIPPER_SCALE_SHIFT)]
@@ -112,9 +119,24 @@ dataset_config = {
         "data_paths": [str(_DATASET_PATH)],
         "urdf": str(_URDF_PATH),
         "cam_names": ["head"],
+        "joint_names": tuple(
+            _ARM_JOINT_NAMES[:7] + ["R_ban"] + _ARM_JOINT_NAMES[7:] + ["L_ban"]
+        ),
+        "finger_keys": [["R_ban_Link"], ["L_ban_Link"]],
+        "has_grippers": True,
         "joint_scale_shift": _joint_scale_shift_from_urdf(_URDF_PATH),
         "T_base2world": _base_to_zhi_from_zero_pose(_URDF_PATH),
-    }
+    },
+    "hc_tj_14dof": {
+        "data_paths": [str(_ARM_ONLY_DATASET_PATH)],
+        "urdf": str(_URDF_PATH),
+        "cam_names": ["head"],
+        "joint_names": tuple(_ARM_JOINT_NAMES),
+        "finger_keys": [[], []],
+        "has_grippers": False,
+        "joint_scale_shift": _arm_joint_scale_shift_from_urdf(_URDF_PATH),
+        "T_base2world": _base_to_zhi_from_zero_pose(_URDF_PATH),
+    },
 }
 
 
@@ -187,19 +209,24 @@ def build_transforms(config, mode, data_config):
 
     arm_state_weight = [1.0, 1.0, 1.0, 1.0, 0.1, 0.1, 0.1, 0.1]
     gripper_state_weight = [1.0, 2.0, 2.0, 2.0, 0.2, 0.2, 0.2, 0.2]
-    loss_weights = np.asarray(
-        [
-            [arm_state_weight] * 7
-            + [gripper_state_weight]
-            + [arm_state_weight] * 7
-            + [gripper_state_weight]
-        ],
-        dtype=np.float32,
-    )
+    if data_config["has_grippers"]:
+        loss_weights = np.asarray(
+            [
+                [arm_state_weight] * 7
+                + [gripper_state_weight]
+                + [arm_state_weight] * 7
+                + [gripper_state_weight]
+            ],
+            dtype=np.float32,
+        )
+        joint_mask = ([True] * 7 + [False]) * 2
+    else:
+        loss_weights = np.asarray([arm_state_weight] * 14, dtype=np.float32)
+        joint_mask = [True] * 14
     add_items = {
         "type": AddItems,
         "T_base2world": data_config["T_base2world"],
-        "joint_mask": ([True] * 7 + [False]) * 2,
+        "joint_mask": joint_mask,
         "joint_scale_shift": data_config["joint_scale_shift"],
     }
     if mode == "training":
@@ -242,7 +269,7 @@ def build_transforms(config, mode, data_config):
             [f"Link{i}_R" for i in range(1, 8)],
             [f"Link{i}_L" for i in range(1, 8)],
         ],
-        "finger_keys": [["R_ban_Link"], ["L_ban_Link"]],
+        "finger_keys": data_config["finger_keys"],
     }
     kinematics = {"type": MultiArmKinematics, **kinematics_config}
 
@@ -279,12 +306,9 @@ def build_transforms(config, mode, data_config):
             projection,
             {
                 "type": JointStateNoise,
-                "noise_range": (
-                    [[-0.02, 0.02]] * 7
-                    + [[0.0, 0.0]]
-                    + [[-0.02, 0.02]] * 7
-                    + [[0.0, 0.0]]
-                ),
+                "noise_range": ([[-0.02, 0.02]] * 7 + [[0.0, 0.0]]) * 2
+                if data_config["has_grippers"]
+                else [[-0.02, 0.02]] * 14,
                 "add_to_pred": True,
             },
             convert_dtype,
@@ -363,6 +387,7 @@ def build_datasets(config, dataset_names, mode, **kwargs):
             paths=paths,
             hist_steps=config["hist_steps"],
             pred_steps=config["pred_steps"],
+            joint_names=data_config["joint_names"],
             transforms=[build(item) for item in as_sequence(transforms)],
         )
         if (

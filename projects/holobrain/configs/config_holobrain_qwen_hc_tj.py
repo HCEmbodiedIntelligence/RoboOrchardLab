@@ -16,11 +16,9 @@
 
 """Qwen HoloBrain training configuration dedicated to the hc_tj dataset."""
 
-import math
 import copy
 import logging
-
-logger = logging.getLogger(__file__)
+import math
 
 from config_holobrain_qwen_common import (
     build_model,
@@ -29,6 +27,8 @@ from config_holobrain_qwen_common import (
     build_validation_dataset,
     config as _common_config,
 )
+
+logger = logging.getLogger(__file__)
 
 __all__ = [
     "build_model",
@@ -41,8 +41,8 @@ __all__ = [
 
 config = copy.deepcopy(_common_config)
 config.update(
-    training_datasets=["hc_tj"],
-    deploy_datasets=["hc_tj"],
+    training_datasets=["hc_tj_14dof"],
+    deploy_datasets=["hc_tj_14dof"],
     batch_size=1,
     step_log_freq=50,
     save_step_freq=5000,
@@ -65,25 +65,27 @@ def cosine_decay_with_warmup_scheduler_build(
 ):
     """Used by Physical Intelligence to train Pi0.
 
-    Automatically scales warmup and decay steps if num_training_steps < num_decay_steps.
-    This ensures the learning rate schedule completes properly even with shorter training runs.
+    Automatically scales warmup and decay steps if num_training_steps is
+    smaller than num_decay_steps. This ensures the learning rate schedule
+    completes properly even with shorter training runs.
     """
 
     from torch import optim
 
-    # Auto-scale scheduler parameters if training steps are shorter than configured decay steps
+    # Scale the scheduler when training is shorter than its configured decay.
     actual_warmup_steps = num_warmup_steps
     actual_decay_steps = num_decay_steps
 
     if num_training_steps < num_decay_steps:
-        # Calculate scaling factor to fit the schedule into the available training steps
+        # Fit the schedule into the available training steps.
         scale_factor = num_training_steps / num_decay_steps
         actual_warmup_steps = int(num_warmup_steps * scale_factor)
         actual_decay_steps = num_training_steps
 
         logging.info(
             f"Auto-scaling LR scheduler: "
-            f"num_training_steps ({num_training_steps}) < num_decay_steps ({num_decay_steps}). "
+            f"num_training_steps ({num_training_steps}) < "
+            f"num_decay_steps ({num_decay_steps}). "
             f"Scaling warmup: {num_warmup_steps} → {actual_warmup_steps}, "
             f"decay: {num_decay_steps} → {actual_decay_steps} "
             f"(scale factor: {scale_factor:.3f})"

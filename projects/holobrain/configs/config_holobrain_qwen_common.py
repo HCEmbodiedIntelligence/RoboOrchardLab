@@ -194,6 +194,7 @@ def build_model(config):
             ),
             decoder=dict(
                 type=HoloBrainActionDecoder,
+                async_inference_plugin=config.get("async_inference_plugin"),
                 head=head,
                 mobile_head=mobile_head,
                 transformer_cfg=HoloBrainDecoderTransformerConfig(

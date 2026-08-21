@@ -28,6 +28,9 @@ from config_hc_tj_ro_dataset import (  # noqa: E402
     build_transforms,
     dataset_config,
 )
+from config_holobrain_qwen_hc_tj import (  # noqa: E402
+    config as model_config,
+)
 
 
 class _Dataset:
@@ -95,10 +98,32 @@ def test_hc_tj_transforms_use_per_arm_gripper_layout():
 def test_hc_tj_config_uses_fixed_16_axis_dataset():
     data_config = dataset_config["hc_tj"]
     assert data_config["data_paths"] == [
-        str(
-            CONFIG_DIR.parent
-            / "data"
-            / "arrow_dataset"
-            / "hc_tj_260818_fix"
-        )
+        str(CONFIG_DIR.parent / "data" / "arrow_dataset" / "hc_tj_260818_fix")
     ]
+
+
+def test_hc_tj_14dof_transforms_exclude_grippers():
+    data_config = dataset_config["hc_tj_14dof"]
+    transforms = build_transforms(
+        {"hist_steps": 1, "pred_steps": 2, "patch_size": 1},
+        "training",
+        data_config,
+    )
+    by_type = {item["type"].__name__: item for item in transforms}
+
+    assert len(data_config["joint_names"]) == 14
+    assert len(data_config["joint_scale_shift"]) == 14
+    assert by_type["AddItems"]["joint_mask"] == [True] * 14
+    assert by_type["MultiArmKinematics"]["finger_keys"] == [[], []]
+    assert by_type["JointStateNoise"]["noise_range"] == [[-0.02, 0.02]] * 14
+
+
+def test_hc_tj_model_config_enables_rtc_for_async_deployment():
+    plugin = model_config["async_inference_plugin"]
+
+    assert plugin == {
+        "type": (
+            "robo_orchard_lab.models.rtc_plugin.rtc_plugin:RTCInferencePlugin"
+        ),
+        "max_horizon": 32,
+    }

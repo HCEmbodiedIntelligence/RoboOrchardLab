@@ -15,11 +15,18 @@
 # permissions and limitations under the License.
 
 import importlib.util
+import json
 import sys
 import types
 import unittest
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
+
+import numpy as np
+import torch
+
+from projects.holobrain.scripts.hc_tj_async_core import HC_TJ_JOINT_NAMES
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[4]
@@ -38,6 +45,10 @@ class _FakeLogger:
     def info(self, *_args, **_kwargs):
         return None
 
+    warning = info
+    error = info
+    exception = info
+
 
 class _FakeLoggerManager:
     def get_child(self, _name):
@@ -45,6 +56,9 @@ class _FakeLoggerManager:
 
 
 class _FakeModel:
+    def __init__(self):
+        self.decoder = types.SimpleNamespace(async_inference_plugin=None)
+
     def eval(self):
         return None
 
@@ -60,9 +74,13 @@ class _FakePipeline:
         cls.load_kwargs = kwargs
         return cls()
 
+    def __call__(self, _model_input):
+        return types.SimpleNamespace(action=torch.zeros((64, 16)))
+
 
 class _FakeMultiArmManipulationInput:
-    pass
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
 
 
 class _FakeFlaskApp:
@@ -76,14 +94,15 @@ class _FakeFlaskApp:
 def _load_script_module(inference_prefix: str = "inference"):
     fake_cli_module = types.ModuleType("robo_orchard_core.utils.cli")
     fake_cli_module.SettingConfig = _FakeSettingConfig
-    fake_cli_module.pydantic_from_argparse = (
-        lambda _config, _parser: types.SimpleNamespace(
+    fake_cli_module.pydantic_from_argparse = lambda _config, _parser: (
+        types.SimpleNamespace(
             model_dir="/tmp/model",
             inference_prefix=inference_prefix,
             port=2000,
             server_name="holobrain",
             num_joints=7,
             valid_action_step=64,
+            input_profile="tri_camera_dual_arm",
         )
     )
 
@@ -133,6 +152,24 @@ def _load_script_module(inference_prefix: str = "inference"):
 
 
 class InferenceServerScriptTest(unittest.TestCase):
+    @staticmethod
+    def _npy(value):
+        payload = BytesIO()
+        np.save(payload, value)
+        payload.seek(0)
+        return payload
+
+    def _valid_async_request(self):
+        return {
+            "head_color": self._npy(np.zeros((4, 6, 3), dtype=np.uint8)),
+            "head_depth": self._npy(np.ones((4, 6), dtype=np.float32)),
+            "head_intrinsic": self._npy(np.eye(4, dtype=np.float64)),
+            "zhi_to_eye": self._npy(np.eye(4, dtype=np.float64)),
+            "current_state": self._npy(np.zeros(16, dtype=np.float32)),
+            "joint_names": json.dumps(HC_TJ_JOINT_NAMES),
+            "instruction": "pick the block",
+        }
+
     def test_loads_pipeline_with_cli_inference_prefix(self):
         _FakePipeline.load_kwargs = None
 
@@ -144,6 +181,71 @@ class InferenceServerScriptTest(unittest.TestCase):
             "robotwin2_0",
         )
         self.assertEqual(_FakePipeline.load_kwargs["directory"], "/tmp/model")
+
+    def test_decodes_and_returns_native_16_axis_actions(self):
+        module = _load_script_module()
+        model_input = module._decode_hc_tj_async_request(
+            self._valid_async_request()
+        )
+        self.assertEqual(model_input.history_joint_state[0].shape, (16,))
+
+        output = module._infer_hc_tj_async(self._valid_async_request())
+
+        self.assertEqual(np.asarray(output["actions"]).shape, (64, 16))
+        self.assertEqual(output["joint_names"], list(HC_TJ_JOINT_NAMES))
+        self.assertEqual(output["action_hz"], 30)
+
+    def test_rejects_wrong_shape_and_rtc_without_plugin(self):
+        module = _load_script_module()
+        bad = self._valid_async_request()
+        bad["current_state"] = self._npy(np.zeros(14, dtype=np.float32))
+        with self.assertRaisesRegex(ValueError, "current_state"):
+            module._decode_hc_tj_async_request(bad)
+
+        request_data = self._valid_async_request()
+        request_data["remaining_actions"] = self._npy(
+            np.zeros((3, 16), dtype=np.float32)
+        )
+        request_data["delay_horizon"] = "1"
+        with self.assertRaisesRegex(ValueError, "RTCInferencePlugin"):
+            module._infer_hc_tj_async(request_data)
+
+    def test_passes_remaining_actions_when_rtc_is_configured(self):
+        module = _load_script_module()
+        rtc_type = type(
+            "RTCInferencePlugin",
+            (),
+            {"__module__": ("robo_orchard_lab.models.rtc_plugin.rtc_plugin")},
+        )
+        module.pipeline.model.decoder.async_inference_plugin = rtc_type()
+        request_data = self._valid_async_request()
+        request_data["remaining_actions"] = self._npy(
+            np.zeros((3, 16), dtype=np.float32)
+        )
+        request_data["delay_horizon"] = "1"
+
+        output = module._infer_hc_tj_async(request_data)
+
+        self.assertEqual(output["action_horizon"], 64)
+
+    def test_async_endpoint_returns_protocol_error_response(self):
+        module = _load_script_module()
+        module.request = types.SimpleNamespace(files={}, form={})
+
+        payload, status = module.hc_tj_async_model_infer()
+
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error_type"], "protocol")
+        self.assertIn("missing required fields", payload["error"])
+
+    def test_legacy_infer_response_format_is_unchanged(self):
+        module = _load_script_module()
+        with patch.object(module, "decode_request", return_value=object()):
+            response = module.infer({})
+        self.assertEqual(
+            set(response),
+            {"left_arm_actions", "right_arm_actions", "action_horizon"},
+        )
 
 
 if __name__ == "__main__":
