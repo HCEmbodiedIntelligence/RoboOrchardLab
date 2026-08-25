@@ -18,6 +18,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -197,9 +198,17 @@ class HoloBrainProcessor(ModelIOProcessor):
             if "urdf" in transform:
                 urdf_file = transform["urdf"]
                 urdfs.append(urdf_file)
-                transform["urdf"] = os.path.join(
-                    urdf_dir, os.path.basename(urdf_file)
-                )
+                if not os.path.isabs(urdf_file):
+                    transform["urdf"] = os.path.join(
+                        urdf_dir, os.path.basename(urdf_file)
+                    )
+                else:
+                    if not os.path.isabs(path):
+                        transform["urdf"] = os.path.join(
+                            path, urdf_dir, os.path.basename(urdf_file)
+                        )
+                    else:
+                        transform["urdf"] = urdf_file
 
         if len(urdfs) > 0:
             if not os.path.isabs(path):
