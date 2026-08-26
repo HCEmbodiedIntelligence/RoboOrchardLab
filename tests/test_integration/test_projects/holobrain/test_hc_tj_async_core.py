@@ -22,6 +22,7 @@ import numpy as np
 import pytest
 
 from projects.holobrain.scripts.hc_tj_async_client import (
+    DEFAULT_JOINT_POSITIONS,
     HcTjAsyncClientConfig,
     ObservationBuffer,
     _other_publisher_names,
@@ -30,6 +31,7 @@ from projects.holobrain.scripts.hc_tj_async_client import (
 from projects.holobrain.scripts.hc_tj_async_core import (
     ACTION_HZ,
     ARM_JOINT_NAMES,
+    CONTROL_JOINT_NAMES,
     HC_TJ_JOINT_NAMES,
     LEFT_HAND_CLOSED,
     LEFT_HAND_OPEN,
@@ -175,8 +177,63 @@ class TestTrajectoryAndSafety:
         _, clipped = hand_command(side, 2)
         assert np.allclose(clipped, closed)
 
+    def test_default_posture_matches_the_17_axis_control_order(self):
+        assert len(DEFAULT_JOINT_POSITIONS) == len(CONTROL_JOINT_NAMES)
+        assert CONTROL_JOINT_NAMES == (
+            "Joint1_R",
+            "Joint2_R",
+            "Joint3_R",
+            "Joint4_R",
+            "Joint5_R",
+            "Joint6_R",
+            "Joint7_R",
+            "Joint1_L",
+            "Joint2_L",
+            "Joint3_L",
+            "Joint4_L",
+            "Joint5_L",
+            "Joint6_L",
+            "Joint7_L",
+            "leg_1",
+            "leg_2",
+            "zhi",
+        )
+        assert DEFAULT_JOINT_POSITIONS == pytest.approx(
+            (
+                -1.130321733036805,
+                -0.7488408179558761,
+                1.2421810235648036,
+                -1.5615996326025259,
+                0.14459746322931552,
+                0.436243163681092,
+                -0.03755520693488968,
+                1.4708313794854644,
+                -0.7665212115377759,
+                -1.5988311572740517,
+                -1.612405156192131,
+                0.03962631818631988,
+                0.13397872423862664,
+                -0.010267844630530324,
+                0.21072105306881997,
+                0.6668054431158328,
+                0.15834697039601572,
+            )
+        )
+
 
 class TestObservationAndConfiguration:
+    def test_latest_joints_is_unavailable_until_first_feedback(self):
+        buffer = ObservationBuffer()
+
+        with pytest.raises(ValueError, match="feedback is unavailable"):
+            buffer.latest_joints()
+
+        expected = np.arange(17, dtype=np.float64)
+        buffer.add_joints(1_000_000_000, expected)
+        latest = buffer.latest_joints()
+        assert latest.timestamp_ns == 1_000_000_000
+        assert np.array_equal(latest.value, expected)
+
     def test_nearest_timestamp_prefers_earlier_and_enforces_tolerance(self):
         values = [TimedValue(90, "early"), TimedValue(110, "late")]
         assert nearest_timed_value(values, 100, 10).value == "early"

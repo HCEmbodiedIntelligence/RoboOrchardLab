@@ -175,7 +175,11 @@ def _decode_hc_tj_async_request(
         intrinsic={"head": validated.head_intrinsic_mat},
         t_world2cam={"head": validated.zhi_to_eye_mat},
         instruction=validated.instruction,
-        remaining_actions=validated.remaining_actions,
+        remaining_actions=(
+            validated.remaining_actions[None]
+            if validated.remaining_actions is not None
+            else None
+        ),
         delay_horizon=validated.delay_horizon,
     )
 

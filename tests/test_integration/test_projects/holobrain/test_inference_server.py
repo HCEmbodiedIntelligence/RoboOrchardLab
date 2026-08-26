@@ -224,6 +224,14 @@ class InferenceServerScriptTest(unittest.TestCase):
         )
         request_data["delay_horizon"] = "1"
 
+        model_input = module._decode_hc_tj_async_request(request_data)
+
+        self.assertEqual(model_input.remaining_actions.shape, (1, 3, 16))
+        request_data = self._valid_async_request()
+        request_data["remaining_actions"] = self._npy(
+            np.zeros((3, 16), dtype=np.float32)
+        )
+        request_data["delay_horizon"] = "1"
         output = module._infer_hc_tj_async(request_data)
 
         self.assertEqual(output["action_horizon"], 64)

@@ -56,7 +56,36 @@ from projects.holobrain.scripts.hc_tj_async_core import (  # noqa: E402
     validate_inference_response,
 )
 
-__all__ = ["HcTjAsyncClientConfig", "ObservationBuffer", "main"]
+__all__ = [
+    "DEFAULT_JOINT_POSITIONS",
+    "HcTjAsyncClientConfig",
+    "ObservationBuffer",
+    "main",
+]
+
+
+# Positions follow CONTROL_JOINT_NAMES: both 7-axis arms, then leg_1,
+# leg_2, and zhi. Hands are commanded by their dedicated publishers.
+DEFAULT_JOINT_POSITIONS = (
+    -1.130321733036805,
+    -0.7488408179558761,
+    1.2421810235648036,
+    -1.5615996326025259,
+    0.14459746322931552,
+    0.436243163681092,
+    -0.03755520693488968,
+    1.4708313794854644,
+    -0.7665212115377759,
+    -1.5988311572740517,
+    -1.612405156192131,
+    0.03962631818631988,
+    0.13397872423862664,
+    -0.010267844630530324,
+    0.21072105306881997,
+    0.6668054431158328,
+    0.15834697039601572,
+)
+_RESET_POSITION_TOLERANCE_RAD = 0.02
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,6 +360,15 @@ def _ros_node_class():
             self.limiter = ArmCommandLimiter(
                 lower, upper, config.max_arm_velocity_rad_s
             )
+            self._default_joint_positions = np.asarray(
+                DEFAULT_JOINT_POSITIONS, dtype=np.float64
+            )
+            if np.any(self._default_joint_positions[:14] < lower) or np.any(
+                self._default_joint_positions[:14] > upper
+            ):
+                raise ValueError(
+                    "default arm posture is outside the HC-TJ URDF limits"
+                )
             self._lock = threading.Lock()
             self._worker = ThreadPoolExecutor(max_workers=1)
             self._future: Future | None = None
@@ -344,6 +382,8 @@ def _ros_node_class():
             self._right_hand_observation = 0.0
             self._left_hand_observation = 0.0
             self._fault: str | None = None
+            self._reset_complete = not config.enable_control
+            self._reset_limiter_initialized = False
 
             reliable = QoSProfile(
                 depth=10, reliability=ReliabilityPolicy.RELIABLE
@@ -401,7 +441,7 @@ def _ros_node_class():
                     self._fault = reason
                     self._control_actions = None
             self.get_logger().error(
-                "Latched fault; restart required: %s", reason
+                f"Latched fault; restart required: {reason}"
             )
 
         def _on_color(self, message: Any) -> None:
@@ -456,6 +496,9 @@ def _ros_node_class():
         def _inference_tick(self) -> None:
             if self.fault is not None:
                 return
+            with self._lock:
+                if not self._reset_complete:
+                    return
             now = time.monotonic()
             if self._future is not None:
                 if not self._future.done():
@@ -563,6 +606,11 @@ def _ros_node_class():
                         return
             try:
                 feedback_sample = self.observations.latest_joints()
+            except ValueError:
+                # A timer may fire before the first ROS feedback. Keep waiting;
+                # subsequent stale or non-finite data is still a latched fault.
+                return
+            try:
                 ros_now_ns = int(self.get_clock().now().nanoseconds)
                 if _state_is_stale(
                     ros_now_ns,
@@ -571,25 +619,57 @@ def _ros_node_class():
                 ):
                     raise ValueError("joint feedback is stale")
                 with self._lock:
-                    if self._control_actions is None:
-                        if not self._received_action_chunk:
-                            return
-                        raise ValueError("action trajectory is empty")
-                    if self._control_index >= len(self._control_actions):
-                        raise ValueError("action trajectory is exhausted")
-                    action = self._control_actions[self._control_index].copy()
-                    self._control_index += 1
-                    arm = self.limiter.step(
-                        arm_actions(action), 1.0 / self.config.control_hz
-                    )
+                    if not self._reset_complete:
+                        if not self._reset_limiter_initialized:
+                            self.limiter.reset(feedback_sample.value[:14])
+                            self._reset_limiter_initialized = True
+                        arm = self.limiter.step(
+                            self._default_joint_positions[:14],
+                            1.0 / self.config.control_hz,
+                        )
+                        action = None
+                        reset_complete = np.all(
+                            np.abs(
+                                feedback_sample.value
+                                - self._default_joint_positions
+                            )
+                            <= _RESET_POSITION_TOLERANCE_RAD
+                        )
+                        if reset_complete:
+                            self._reset_complete = True
+                    else:
+                        if self._control_actions is None:
+                            if not self._received_action_chunk:
+                                return
+                            raise ValueError("action trajectory is empty")
+                        if self._control_index >= len(self._control_actions):
+                            raise ValueError("action trajectory is exhausted")
+                        action = self._control_actions[
+                            self._control_index
+                        ].copy()
+                        self._control_index += 1
+                        arm = self.limiter.step(
+                            arm_actions(action), 1.0 / self.config.control_hz
+                        )
                 joint_message = JointState()
                 joint_message.header.stamp = self.get_clock().now().to_msg()
                 joint_message.name = list(CONTROL_JOINT_NAMES)
                 joint_message.position = [
                     *arm.tolist(),
-                    *feedback_sample.value[14:].tolist(),
+                    *(
+                        self._default_joint_positions[14:].tolist()
+                        if action is None
+                        else feedback_sample.value[14:].tolist()
+                    ),
                 ]
                 self._joint_publisher.publish(joint_message)
+
+                if action is None:
+                    if reset_complete:
+                        self.get_logger().info(
+                            "default HC-TJ posture reached; inference enabled"
+                        )
+                    return
 
                 for side, closure, publisher in (
                     ("right", action[7], self._right_hand_publisher),
