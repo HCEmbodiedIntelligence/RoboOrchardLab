@@ -189,11 +189,13 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
     def forward(self, inputs):
         if self.data_preprocessor is not None:
             device = next(self.parameters()).device
-            # dict_keys(['uuid', 'imgs', 'depths', 'text',
-            # 'state_loss_weights', 'fk_loss_weight', 'joint_mask',
-            # 'image_wh', 'projection_mat', 'embodiedment_mat',
-            # 'joint_scale_shift', 'pred_robot_state', 'hist_robot_state',
-            # 'kinematics', 'origin_imgs', 'img_mean', 'img_std', 'depth_prob_gt', 'instruction'])
+            #input dict_keys(
+            # ['text', 'imgs', 'depths', 'uuid', 'joint_mask', 'joint_scale_shift',
+            # 'state_loss_weights', 'fk_loss_weight', 'pred_mask', 'image_wh',
+            # 'projection_mat', 'embodiedment_mat', 'pred_robot_state',
+            # 'hist_robot_state', 'kinematics', 'dataset_index'])
+            # NOTE: data_preprocessor is <class 'robo_orchard_lab.models.layers.data_preprocessors.BaseDataPreprocessor'>
+            # 用来处理输入数据, 例如归一化图像、生成掩码等.
             inputs = self.data_preprocessor(inputs, device)
         if self.training:
             return self.loss(inputs)
@@ -201,6 +203,12 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
             return self.predict(inputs)
 
     def loss(self, inputs):
+        # NOTE: inputs keys:
+        #dict_keys(['text', 'imgs', 'depths', 'uuid', 'joint_mask',
+        # 'joint_scale_shift', 'state_loss_weights', 'fk_loss_weight',
+        # 'pred_mask', 'image_wh', 'projection_mat', 'embodiedment_mat',
+        # 'pred_robot_state', 'hist_robot_state', 'kinematics', 'dataset_index',
+        # 'origin_imgs', 'img_mean', 'img_std', 'depth_prob_gt', 'instruction'])
         model_outs, _, text_dict, loss_depth = self._forward(inputs)
         loss = self.decoder.loss(model_outs, inputs, text_dict=text_dict)
         if loss_depth is not None:

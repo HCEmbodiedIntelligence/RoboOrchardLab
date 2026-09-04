@@ -953,6 +953,21 @@ class ROMultiRowDataset(RODataset):
         return ret
 
     def __getitem_no_transform__(self, index: int | slice | list[int]) -> dict:
+        """
+            joints: <class 'list'>-shape: (65,)
+            actions: <class 'list'>-shape: (65,)
+            head: <class 'robo_orchard_core.datatypes.camera_data.BatchCameraDataEncoded'>-shape: None
+            head_depth: <class 'robo_orchard_core.datatypes.camera_data.BatchCameraDataEncoded'>-shape: None
+            index: <class 'int'>-shape: None
+            frame_index: <class 'int'>-shape: None
+            timestamp_min: <class 'int'>-shape: None
+            timestamp_max: <class 'int'>-shape: None
+            episode: <class 'robo_orchard_lab.dataset.robot.db_orm.episode.Episode'>-shape: None
+            task: <class 'robo_orchard_lab.dataset.robot.db_orm.task.Task'>-shape: None
+            robot: <class 'robo_orchard_lab.dataset.robot.db_orm.robot.Robot'>-shape: None
+            instruction: <class 'robo_orchard_lab.dataset.robot.db_orm.instruction.Instruction'>-shape: None
+
+        """
         cached_index_dataset = CachedIndexDataset(self.index_dataset)
 
         def fast_column_get(col_name: str, idx_rows: list[int | None]):
@@ -1139,6 +1154,11 @@ class ConcatRODataset(TorchDataset):
             dataset_idx, sample_idx = self._map_index_to_dataset(index)
             ret = self.datasets[dataset_idx][sample_idx]
             ret[self.dataset_index_key] = dataset_idx
+            # ret key: 
+            # dict_keys(['text', 'imgs', 'depths', 'uuid', 'joint_mask', 
+            # 'joint_scale_shift', 'state_loss_weights', 'fk_loss_weight', 
+            # 'pred_mask', 'image_wh', 'projection_mat', 'embodiedment_mat', 
+            # 'pred_robot_state', 'hist_robot_state', 'kinematics', 'dataset_index'])
             return ret
 
         elif isinstance(index, list):

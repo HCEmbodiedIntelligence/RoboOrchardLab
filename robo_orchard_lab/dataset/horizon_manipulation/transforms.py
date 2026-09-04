@@ -96,6 +96,11 @@ class JointStateNoise:
 
 
 class SimpleStateSampling:
+    """把一整段关节序列整理成“历史观测输入”和“未来动作监督”，供 HoloBrain 训练或推理使用
+       从数据集中已有的轨迹里选出历史状态和未来64步监督标签。
+       未来标签是 HoloBrain 动作预测分支的主要训练目标，不只是辅助 loss。
+
+    """
     def __init__(
         self,
         hist_steps,
@@ -385,6 +390,18 @@ class ItemSelection:
 
 
 class MultiArmKinematics:
+    """HoloBrain 数据管线中的确定性运动学转换器。它本身不是神经网络层、没有可训练参数，主要负责：
+
+    1. 根据 URDF 将关节角通过前向运动学转换为每个机械臂链节的空间位姿；
+    2. 把每个关节从单一标量扩展成 8 维机器人状态；
+    3. 为关节图注意力提供关节间拓扑距离；
+    4. 在训练中生成历史条件、未来监督目标，并支持可微 FK 辅助损失。
+
+    MultiArmKinematics 的核心作用是：
+
+    > 利用真实机器人 URDF 做前向运动学，把单纯的关节值 q 扩展成“关节值 + 
+    每个链节的三维位置和姿态”，并把结果提供给机器人状态编码器、扩散动作解码器以及 FK 辅助损失。
+    """
     def __init__(
         self,
         urdf,

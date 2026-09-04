@@ -245,6 +245,42 @@ class HcTjRODataset(TorchDataset):
         return len(self._concat)
 
     def __getitem__(self, index):
+        """
+
+        Args:
+            index (int): 索引
+
+        Returns:
+            dict: 形式如下：
+            {
+                joints: <class 'list'>-shape: (65,)
+                actions: <class 'list'>-shape: (65,)
+                head: <class 'robo_orchard_core.datatypes.camera_data.BatchCameraDataEncoded'>-shape: None
+                head_depth: <class 'robo_orchard_core.datatypes.camera_data.BatchCameraDataEncoded'>-shape: None
+                index: <class 'int'>-shape: None
+                frame_index: <class 'int'>-shape: None
+                timestamp_min: <class 'int'>-shape: None
+                timestamp_max: <class 'int'>-shape: None
+                episode: <class 'robo_orchard_lab.dataset.robot.db_orm.episode.Episode'>-shape: None
+                task: <class 'robo_orchard_lab.dataset.robot.db_orm.task.Task'>-shape: None
+                robot: <class 'robo_orchard_lab.dataset.robot.db_orm.robot.Robot'>- 放着urdf的内容
+                instruction: <class 'robo_orchard_lab.dataset.robot.db_orm.instruction.Instruction'> - 内容和task差不多
+                --- add from transform ---
+                text: <class 'str'>-shape: None
+                imgs: <class 'numpy.ndarray'>-shape: (1, 400, 640, 3)
+                depths: <class 'numpy.ndarray'>-shape: (1, 400, 640)
+                intrinsic: <class 'numpy.ndarray'>-shape: (1, 4, 4)
+                T_world2cam: <class 'numpy.ndarray'>-shape: (1, 4, 4) zhi_Link -> eye
+                joint_state: <class 'numpy.ndarray'>-shape: (65, 16) 机器人关节实际返回位置
+                master_joint_state: <class 'numpy.ndarray'>-shape: (65, 16) 下发给机器人的关节位置
+                step_index: <class 'int'>-shape: None
+                step_index_in_chunk: <class 'int'>-shape: None
+                task_name: <class 'str'>-shape: None
+                uuid: <class 'str'>-shape: None
+                cam_names: <class 'list'>-shape: (1,)
+                dataset_index: <class 'int'>-shape: None
+            }
+        """
         return self._concat[index]
 
     def __getitems__(self, indices):
