@@ -410,7 +410,8 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
         if attention_mask is not None:
             attention_mask = attention_mask.to(inputs_embeds.device)
 
-        if hasattr(self.vlm.model, "language_model"):
+        if not hasattr(self.vlm, "language_model"):
+            # transformers > 4.57.1
             if mm_token_type_ids is None:
                 mm_token_type_ids = torch.zeros_like(input_ids)
                 mm_token_type_ids[
