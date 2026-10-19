@@ -340,6 +340,7 @@ class HoloBrainActionDecoder(nn.Module):
         joint_scale_shift: torch.Tensor,
         joint_mask: torch.Tensor,
     ):
+        # NOTE: 这里处理是相对还是绝对值
         """Adjusts model_pred to absolute result based on prediction_type.
 
         Args:
@@ -357,6 +358,8 @@ class HoloBrainActionDecoder(nn.Module):
                 position), shape same as model_pred.
         """
 
+        # model_pred shape，bs action_chunk,joint_num, state_dim
+        # state_dim [joint_pos,x,y,z,qx,qy,qz,qw]
         origin_model_pred = model_pred.clone()
         if not self.pred_scaled_joint:
             model_pred = apply_scale_shift(
@@ -366,6 +369,7 @@ class HoloBrainActionDecoder(nn.Module):
         if self.prediction_type == "absolute_joint_absolute_pose":
             pred = model_pred
         elif self.prediction_type == "absolute_joint_relative_pose":
+            # FIXME: 这里相对位姿直接相加了，可能有点问题？
             pred = torch.cat(
                 [
                     model_pred[..., :1],
@@ -434,12 +438,13 @@ class HoloBrainActionDecoder(nn.Module):
         text_dict = text_dict.copy() if text_dict is not None else {}
         img_feature = self.format_img_feature_maps(feature_maps)
 
-        if "hist_robot_state" not in inputs:
-            hist_robot_state = self.joint_state_to_robot_state(
-                inputs["hist_joint_state"], inputs
-            )
-        else:
-            hist_robot_state = inputs["hist_robot_state"]
+        # XXX: 这个分支似乎永远不会触发
+        # if "hist_robot_state" not in inputs:
+        #     hist_robot_state = self.joint_state_to_robot_state(
+        #         inputs["hist_joint_state"], inputs
+        #     )
+        # else:
+        hist_robot_state = inputs["hist_robot_state"]
 
         joint_scale_shift = inputs.get("joint_scale_shift")
         hist_robot_state = apply_scale_shift(

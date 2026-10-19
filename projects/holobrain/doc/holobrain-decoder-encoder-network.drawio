@@ -1,0 +1,390 @@
+<mxfile host="65bd71144e">
+    <diagram name="1 总览" id="page1">
+        <mxGraphModel grid="1" page="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" pageScale="1" pageWidth="1700" pageHeight="1700" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="title" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;spacing=7;" value="&lt;b&gt;1 总览&lt;/b&gt;" vertex="1">
+                    <mxGeometry height="60" width="1450" x="40" y="25" as="geometry"/>
+                </mxCell>
+                <mxCell id="sub" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;spacing=7;" value="B=批量 H=历史步 P=未来步 J=关节数 S=单关节状态维 D=特征维 C=时间块长 M=候选轨迹数" vertex="1">
+                    <mxGeometry height="55" width="1450" x="40" y="95" as="geometry"/>
+                </mxCell>
+                <mxCell id="raw" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;spacing=7;" value="&lt;b&gt;原始输入&lt;/b&gt;&lt;br&gt;图像、深度、文字&lt;br&gt;历史机器人状态" vertex="1">
+                    <mxGeometry height="90" width="210" x="40" y="220" as="geometry"/>
+                </mxCell>
+                <mxCell id="up" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;spacing=7;" value="&lt;b&gt;上游视觉语言网络&lt;/b&gt;&lt;br&gt;图像 [B,Nimg,D]&lt;br&gt;文字 [B,Ntxt,D]" vertex="1">
+                    <mxGeometry height="90" width="210" x="360" y="220" as="geometry"/>
+                </mxCell>
+                <mxCell id="hist" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;spacing=7;" value="&lt;b&gt;历史状态&lt;/b&gt;&lt;br&gt;hist_robot_state [B,H,J,S]" vertex="1">
+                    <mxGeometry height="90" width="210" x="40" y="440" as="geometry"/>
+                </mxCell>
+                <mxCell id="norm" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;spacing=7;" value="&lt;b&gt;关节角归一化&lt;/b&gt;&lt;br&gt;第 0 通道" vertex="1">
+                    <mxGeometry height="90" width="210" x="360" y="440" as="geometry"/>
+                </mxCell>
+                <mxCell id="enc" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;spacing=7;" value="&lt;b&gt;RobotStateEncoder&lt;/b&gt;&lt;br&gt;[B,J,H/Ce,D]" vertex="1">
+                    <mxGeometry height="90" width="210" x="700" y="440" as="geometry"/>
+                </mxCell>
+                <mxCell id="noise" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;spacing=7;" value="&lt;b&gt;未来动作起点&lt;/b&gt;&lt;br&gt;训练：真值加噪&lt;br&gt;推理：随机噪声&lt;br&gt;[B,P,J,S]" vertex="1">
+                    <mxGeometry height="90" width="210" x="40" y="690" as="geometry"/>
+                </mxCell>
+                <mxCell id="dec" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;spacing=7;" value="&lt;b&gt;ActionDecoder&lt;/b&gt;&lt;br&gt;注意力 + 去噪&lt;br&gt;[B,P,J,S]" vertex="1">
+                    <mxGeometry height="90" width="210" x="700" y="690" as="geometry"/>
+                </mxCell>
+                <mxCell id="out" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;spacing=7;" value="&lt;b&gt;解码器输出&lt;/b&gt;&lt;br&gt;训练 pred / target&lt;br&gt;推理 pred_actions" vertex="1">
+                    <mxGeometry height="90" width="210" x="1030" y="690" as="geometry"/>
+                </mxCell>
+                <mxCell id="config" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;spacing=7;" value="&lt;b&gt;Qwen 默认&lt;/b&gt;&lt;br&gt;H=1，P=64，C=4，S=8，D=256&lt;br&gt;Ce=1；P/C=16；J 取决于机器人" vertex="1">
+                    <mxGeometry height="105" width="390" x="1030" y="420" as="geometry"/>
+                </mxCell>
+                <mxCell id="e13" edge="1" parent="1" source="raw" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="up">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e14" edge="1" parent="1" source="hist" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="norm">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e15" edge="1" parent="1" source="norm" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="enc">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e16" edge="1" parent="1" source="up" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="dec">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="630" y="265"/>
+                            <mxPoint x="630" y="720"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e17" edge="1" parent="1" source="enc" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="dec">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e18" edge="1" parent="1" source="noise" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="dec">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e19" edge="1" parent="1" source="dec" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="out">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+    <diagram name="2 RobotStateEncoder" id="page2">
+        <mxGraphModel grid="1" page="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" pageScale="1" pageWidth="1700" pageHeight="1700" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="title" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;spacing=7;" value="&lt;b&gt;2 RobotStateEncoder&lt;/b&gt;" vertex="1">
+                    <mxGeometry height="60" width="1450" x="40" y="25" as="geometry"/>
+                </mxCell>
+                <mxCell id="sub" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;spacing=7;" value="robot_state_encoder.py；通用形状与当前 Qwen 默认值 H=1、Ce=1、S=8、D=256" vertex="1">
+                    <mxGeometry height="55" width="1450" x="40" y="95" as="geometry"/>
+                </mxCell>
+                <mxCell id="i" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;spacing=7;" value="&lt;b&gt;robot_state&lt;/b&gt;&lt;br&gt;[B,H,J,S]&lt;br&gt;S=角度1+位姿7" vertex="1">
+                    <mxGeometry height="90" width="210" x="40" y="220" as="geometry"/>
+                </mxCell>
+                <mxCell id="perm" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;spacing=7;" value="&lt;b&gt;permute&lt;/b&gt;&lt;br&gt;[B,J,H,S]" vertex="1">
+                    <mxGeometry height="90" width="210" x="310" y="220" as="geometry"/>
+                </mxCell>
+                <mxCell id="mask" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;spacing=7;" value="&lt;b&gt;可选 joint_mask&lt;/b&gt;&lt;br&gt;遮蔽关节角" vertex="1">
+                    <mxGeometry height="90" width="210" x="580" y="220" as="geometry"/>
+                </mxCell>
+                <mxCell id="chunk" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;spacing=7;" value="&lt;b&gt;时间分块&lt;/b&gt;&lt;br&gt;[B,J,H/Ce,Ce×S]" vertex="1">
+                    <mxGeometry height="90" width="210" x="850" y="220" as="geometry"/>
+                </mxCell>
+                <mxCell id="fc" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;spacing=7;" value="&lt;b&gt;input_fc&lt;/b&gt;&lt;br&gt;线性+激活+Norm&lt;br&gt;[B,J,H/Ce,D]" vertex="1">
+                    <mxGeometry height="90" width="210" x="1120" y="220" as="geometry"/>
+                </mxCell>
+                <mxCell id="dist" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;spacing=7;" value="&lt;b&gt;joint_distance&lt;/b&gt;&lt;br&gt;[B,J,J] → tile&lt;br&gt;[B×H/Ce,J,J]" vertex="1">
+                    <mxGeometry height="90" width="210" x="60" y="500" as="geometry"/>
+                </mxCell>
+                <mxCell id="attn" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;spacing=7;" value="&lt;b&gt;关节自注意力&lt;/b&gt;&lt;br&gt;每时间块 [B×H/Ce,J,D]&lt;br&gt;query/key/value=x" vertex="1">
+                    <mxGeometry height="100" width="260" x="410" y="495" as="geometry"/>
+                </mxCell>
+                <mxCell id="restore" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;spacing=7;" value="&lt;b&gt;还原维度&lt;/b&gt;&lt;br&gt;[B,J,H/Ce,D]" vertex="1">
+                    <mxGeometry height="90" width="210" x="780" y="500" as="geometry"/>
+                </mxCell>
+                <mxCell id="ffn" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;spacing=7;" value="&lt;b&gt;Norm → FFN&lt;/b&gt;&lt;br&gt;形状不变" vertex="1">
+                    <mxGeometry height="90" width="210" x="1070" y="500" as="geometry"/>
+                </mxCell>
+                <mxCell id="repeat" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;spacing=7;" value="&lt;b&gt;Qwen 层序&lt;/b&gt;&lt;br&gt;(Norm → joint_self_attn → Norm → FFN)×4&lt;br&gt;末尾再 Norm；未启用时间注意力" vertex="1">
+                    <mxGeometry height="105" width="560" x="390" y="760" as="geometry"/>
+                </mxCell>
+                <mxCell id="o" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;spacing=7;" value="&lt;b&gt;robot_feature&lt;/b&gt;&lt;br&gt;[B,J,H/Ce,D]&lt;br&gt;默认 [B,J,1,256]" vertex="1">
+                    <mxGeometry height="100" width="240" x="1100" y="760" as="geometry"/>
+                </mxCell>
+                <mxCell id="e15" edge="1" parent="1" source="i" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="perm">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e16" edge="1" parent="1" source="perm" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="mask">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e17" edge="1" parent="1" source="mask" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="chunk">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e18" edge="1" parent="1" source="chunk" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="fc">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e19" edge="1" parent="1" source="fc" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="attn">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="1225" y="380"/>
+                            <mxPoint x="540" y="380"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e20" edge="1" parent="1" source="dist" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="attn">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e21" edge="1" parent="1" source="attn" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="restore">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e22" edge="1" parent="1" source="restore" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="ffn">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e23" edge="1" parent="1" source="ffn" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="repeat">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="1175" y="670"/>
+                            <mxPoint x="670" y="670"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e24" edge="1" parent="1" source="repeat" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="o">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="fLE1V57vIKcroqYvpjAo-1" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;" value="H: 历史步数 1&lt;div&gt;Ce：编码器分块长度 1&lt;/div&gt;&lt;div&gt;P：预测部署 64&lt;/div&gt;&lt;div&gt;C解码器分块长度 4&lt;/div&gt;&lt;div&gt;S：单个关节状态维 8&lt;/div&gt;&lt;div&gt;D：特征维度 256&lt;/div&gt;&lt;div&gt;J：关节数量 14&lt;/div&gt;" vertex="1">
+                    <mxGeometry height="230" width="230" x="50" y="620" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+    <diagram name="3 ActionDecoder 单次网络" id="page3">
+        <mxGraphModel dx="790" dy="716" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1700" pageHeight="1700" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="title" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;spacing=7;" value="&lt;b&gt;3 ActionDecoder 单次网络&lt;/b&gt;" vertex="1">
+                    <mxGeometry height="60" width="1450" x="40" y="25" as="geometry"/>
+                </mxCell>
+                <mxCell id="sub" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;spacing=7;" value="action_decoder.py forward_layers；Qwen 默认 P=64 C=4 Nc=P/C=16 S=8 D=256；训练一次、推理每去噪步一次" vertex="1">
+                    <mxGeometry height="55" width="1450" x="40" y="95" as="geometry"/>
+                </mxCell>
+                <mxCell id="i" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;spacing=7;" value="&lt;b&gt;noisy_action&lt;/b&gt;&lt;br&gt;[B,P,J,S]" vertex="1">
+                    <mxGeometry height="90" width="210" x="40" y="220" as="geometry"/>
+                </mxCell>
+                <mxCell id="perm" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;spacing=7;" value="&lt;b&gt;permute + mask&lt;/b&gt;&lt;br&gt;[B,J,P,S]" vertex="1">
+                    <mxGeometry height="90" width="210" x="310" y="220" as="geometry"/>
+                </mxCell>
+                <mxCell id="chunk" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;spacing=7;" value="&lt;b&gt;时间分块&lt;/b&gt;&lt;br&gt;[B,J,Nc,C×S]&lt;br&gt;默认 C×S=32" vertex="1">
+                    <mxGeometry height="90" width="210" x="580" y="220" as="geometry"/>
+                </mxCell>
+                <mxCell id="fc" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;spacing=7;" value="&lt;b&gt;input_layers&lt;/b&gt;&lt;br&gt;Linear 32→256&lt;br&gt;[B,J,Nc,D]" vertex="1">
+                    <mxGeometry height="90" width="210" x="850" y="220" as="geometry"/>
+                </mxCell>
+                <mxCell id="flat" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;spacing=7;" value="&lt;b&gt;展开 token&lt;/b&gt;&lt;br&gt;[B,J×Nc,D]" vertex="1">
+                    <mxGeometry height="90" width="210" x="1120" y="220" as="geometry"/>
+                </mxCell>
+                <mxCell id="t" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;spacing=7;" value="&lt;b&gt;扩散时间 t&lt;/b&gt;&lt;br&gt;ScalarEmbedder(t)" vertex="1">
+                    <mxGeometry height="90" width="210" x="30" y="570" as="geometry"/>
+                </mxCell>
+                <mxCell id="robot" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;spacing=7;" value="&lt;b&gt;状态编码器特征&lt;/b&gt;&lt;br&gt;[B,J,H/Ce,D]" vertex="1">
+                    <mxGeometry height="90" width="210" x="30" y="450" as="geometry"/>
+                </mxCell>
+                <mxCell id="a1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;spacing=7;" value="&lt;b&gt;每层前半&lt;/b&gt;&lt;br&gt;AdaRMSNorm(t) → temp_joint_attn&lt;br&gt;→ gate_msa → Norm" vertex="1">
+                    <mxGeometry height="105" width="240" x="580" y="500" as="geometry"/>
+                </mxCell>
+                <mxCell id="a2" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;spacing=7;" value="&lt;b&gt;每层后半&lt;/b&gt;&lt;br&gt;图像/文字 cross-attn + Norm&lt;br&gt;scale_shift → FFN → gate_mlp" vertex="1">
+                    <mxGeometry height="105" width="260" x="900" y="500" as="geometry"/>
+                </mxCell>
+                <mxCell id="layers" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;spacing=7;" value="&lt;b&gt;共 6 层&lt;/b&gt;&lt;br&gt;保持 [B,J×Nc,D]" vertex="1">
+                    <mxGeometry height="90" width="210" x="1240" y="507.5" as="geometry"/>
+                </mxCell>
+                <mxCell id="img" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;spacing=7;" value="&lt;b&gt;图像特征&lt;/b&gt;&lt;br&gt;[B,Nimg,D]" vertex="1">
+                    <mxGeometry height="90" width="210" x="40" y="770" as="geometry"/>
+                </mxCell>
+                <mxCell id="txt" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;spacing=7;" value="&lt;b&gt;文字特征 + mask&lt;/b&gt;&lt;br&gt;[B,Ntxt,D]" vertex="1">
+                    <mxGeometry height="90" width="210" x="310" y="770" as="geometry"/>
+                </mxCell>
+                <mxCell id="unflat" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;spacing=7;" value="&lt;b&gt;还原 token&lt;/b&gt;&lt;br&gt;[B,J,Nc,D]&lt;br&gt;默认 [B,J,16,256]" vertex="1">
+                    <mxGeometry height="90" width="210" x="580" y="777.5" as="geometry"/>
+                </mxCell>
+                <mxCell id="head" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;spacing=7;" value="&lt;b&gt;UpsampleHead&lt;/b&gt;&lt;br&gt;时间 16→32→64&lt;br&gt;通道 256→128→64→8" vertex="1">
+                    <mxGeometry height="105" width="240" x="880" y="770" as="geometry"/>
+                </mxCell>
+                <mxCell id="out" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;spacing=7;" value="&lt;b&gt;单次预测&lt;/b&gt;&lt;br&gt;[B,P,J,S]&lt;br&gt;默认 [B,64,J,8]" vertex="1">
+                    <mxGeometry height="90" width="210" x="1230" y="777.5" as="geometry"/>
+                </mxCell>
+                <mxCell id="note" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;spacing=7;" value="&lt;b&gt;可选分支&lt;/b&gt;&lt;br&gt;with_mobile=True 时增加移动轨迹 token 与 mobile_head；默认关闭。" vertex="1">
+                    <mxGeometry height="85" width="570" x="40" y="1000" as="geometry"/>
+                </mxCell>
+                <mxCell id="convert" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;spacing=7;" value="&lt;b&gt;get_prediction&lt;/b&gt;&lt;br&gt;单次网络输出后将相对预测转成绝对状态；Qwen 使用 relative_joint_relative_pose。" vertex="1">
+                    <mxGeometry height="85" width="650" x="750" y="1000" as="geometry"/>
+                </mxCell>
+                <mxCell id="e21" edge="1" parent="1" source="i" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="perm">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e22" edge="1" parent="1" source="perm" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="chunk">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e23" edge="1" parent="1" source="chunk" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="fc">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e24" edge="1" parent="1" source="fc" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="flat">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e25" edge="1" parent="1" source="flat" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="a1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="1225" y="410"/>
+                            <mxPoint x="700" y="410"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e26" edge="1" parent="1" source="t" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="a1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="410" y="615"/>
+                            <mxPoint x="410" y="570"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e27" edge="1" parent="1" source="robot" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="a1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="410" y="495"/>
+                            <mxPoint x="410" y="540"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e28" edge="1" parent="1" source="a1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="a2">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e29" edge="1" parent="1" source="img" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="a2">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="145" y="670"/>
+                            <mxPoint x="990" y="670"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e30" edge="1" parent="1" source="txt" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="a2">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="415" y="650"/>
+                            <mxPoint x="1080" y="650"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e31" edge="1" parent="1" source="a2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="layers">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e32" edge="1" parent="1" source="layers" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="unflat">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="1345" y="690"/>
+                            <mxPoint x="685" y="690"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e33" edge="1" parent="1" source="unflat" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="head">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e34" edge="1" parent="1" source="head" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" target="out">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="jointpos" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;spacing=7;" value="&lt;b&gt;joint_relative_pos&lt;/b&gt;&lt;br&gt;[B,J,J]&lt;br&gt;关节间相对位置" vertex="1">
+                    <mxGeometry height="90" width="220" x="1280" y="340" as="geometry"/>
+                </mxCell>
+                <mxCell id="added_jointpos_a1" edge="1" parent="1" source="jointpos" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#d6b656;strokeWidth=2;dashed=1;" target="a1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="1390" y="450"/>
+                            <mxPoint x="760" y="450"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="maskscale" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;spacing=7;" value="&lt;b&gt;其他条件&lt;/b&gt;&lt;br&gt;joint_mask [B,J]&lt;br&gt;joint_scale_shift [B,J,2]" vertex="1">
+                    <mxGeometry height="90" width="280" x="275" y="365" as="geometry"/>
+                </mxCell>
+                <mxCell id="added_maskscale_perm" edge="1" parent="1" source="maskscale" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#d6b656;strokeWidth=2;dashed=1;" target="perm">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+    <diagram name="4 训练与推理" id="page4">
+        <mxGraphModel dx="1600" dy="1100" grid="1" gridSize="10" page="1" pageScale="1" pageWidth="1700" pageHeight="1700">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="title" value="&lt;b&gt;4 训练与推理&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;spacing=7;" vertex="1" parent="1">
+                    <mxGeometry x="40" y="25" width="1450" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="sub" value="train()/eval() 决定分支；共用第 3 页网络；Qwen 默认训练扩为 4B、推理去噪 10 步" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;spacing=7;" vertex="1" parent="1">
+                    <mxGeometry x="40" y="95" width="1450" height="55" as="geometry"/>
+                </mxCell>
+                <mxCell id="tr0" value="&lt;b&gt;训练输入&lt;/b&gt;&lt;br&gt;历史状态+条件特征&lt;br&gt;未来真值 [B,P,J,S]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;spacing=7;" vertex="1" parent="1">
+                    <mxGeometry x="40" y="220" width="210" height="90" as="geometry"/>
+                </mxCell>
+                <mxCell id="tr1" value="&lt;b&gt;归一化 + 复制&lt;/b&gt;&lt;br&gt;4 个并行样本&lt;br&gt;有效批量 B′=4B" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;spacing=7;" vertex="1" parent="1">
+                    <mxGeometry x="320" y="220" width="210" height="90" as="geometry"/>
+                </mxCell>
+                <mxCell id="tr2" value="&lt;b&gt;随机时间步 t&lt;/b&gt;&lt;br&gt;DDPM 1000 步中抽取&lt;br&gt;真值 + 噪声" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;spacing=7;" vertex="1" parent="1">
+                    <mxGeometry x="600" y="220" width="210" height="90" as="geometry"/>
+                </mxCell>
+                <mxCell id="tr3" value="&lt;b&gt;forward_layers 一次&lt;/b&gt;&lt;br&gt;pred [B′,P,J,S]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;spacing=7;" vertex="1" parent="1">
+                    <mxGeometry x="880" y="220" width="210" height="90" as="geometry"/>
+                </mxCell>
+                <mxCell id="tr4" value="&lt;b&gt;返回并计算 loss&lt;/b&gt;&lt;br&gt;pred / target / t&lt;br&gt;角度、位置、姿态" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;spacing=7;" vertex="1" parent="1">
+                    <mxGeometry x="1160" y="220" width="210" height="90" as="geometry"/>
+                </mxCell>
+                <mxCell id="in0" value="&lt;b&gt;推理输入&lt;/b&gt;&lt;br&gt;历史状态+条件特征&lt;br&gt;无未来真值" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;spacing=7;" vertex="1" parent="1">
+                    <mxGeometry x="40" y="590" width="210" height="90" as="geometry"/>
+                </mxCell>
+                <mxCell id="in1" value="&lt;b&gt;sample_noise&lt;/b&gt;&lt;br&gt;初值 [B,64,J,8]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;spacing=7;" vertex="1" parent="1">
+                    <mxGeometry x="320" y="590" width="210" height="90" as="geometry"/>
+                </mxCell>
+                <mxCell id="in2" value="&lt;b&gt;去噪循环 ×10&lt;/b&gt;&lt;br&gt;forward_layers → get_prediction&lt;br&gt;可选 RTC → scheduler.step" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;spacing=7;" vertex="1" parent="1">
+                    <mxGeometry x="600" y="580" width="240" height="110" as="geometry"/>
+                </mxCell>
+                <mxCell id="in3" value="&lt;b&gt;原始返回&lt;/b&gt;&lt;br&gt;pred_actions [B,M,64,J,8]&lt;br&gt;默认 M=1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;spacing=7;" vertex="1" parent="1">
+                    <mxGeometry x="900" y="590" width="225" height="95" as="geometry"/>
+                </mxCell>
+                <mxCell id="in4" value="&lt;b&gt;post_process&lt;/b&gt;&lt;br&gt;关节角反归一化&lt;br&gt;每样本一个字典" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;spacing=7;" vertex="1" parent="1">
+                    <mxGeometry x="1190" y="590" width="210" height="90" as="geometry"/>
+                </mxCell>
+                <mxCell id="note" value="&lt;b&gt;边界&lt;/b&gt;&lt;br&gt;解码器只输出张量；推理服务在模型外包装 JSON。" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;spacing=7;" vertex="1" parent="1">
+                    <mxGeometry x="350" y="840" width="680" height="85" as="geometry"/>
+                </mxCell>
+                <mxCell id="e15" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" edge="1" source="tr0" target="tr1" parent="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e16" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" edge="1" source="tr1" target="tr2" parent="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e17" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" edge="1" source="tr2" target="tr3" parent="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e18" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" edge="1" source="tr3" target="tr4" parent="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e19" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" edge="1" source="in0" target="in1" parent="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e20" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" edge="1" source="in1" target="in2" parent="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e21" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" edge="1" source="in2" target="in3" parent="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e22" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#64748b;strokeWidth=2;" edge="1" source="in3" target="in4" parent="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="rtc" value="&lt;b&gt;异步推理可选输入&lt;/b&gt;&lt;br&gt;remaining_actions [B,R,J]&lt;br&gt;delay_horizon：整数&lt;br&gt;需配置 RTC 插件" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;spacing=7;" vertex="1" parent="1">
+                    <mxGeometry x="350" y="1000" width="330" height="105" as="geometry"/>
+                </mxCell>
+                <mxCell id="added_rtc_in2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=classic;strokeColor=#d6b656;strokeWidth=2;dashed=1;" edge="1" source="rtc" target="in2" parent="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>

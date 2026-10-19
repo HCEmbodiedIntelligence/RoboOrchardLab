@@ -47,6 +47,8 @@ Joint1_R..Joint7_R, R_ban, Joint1_L..Joint7_L, L_ban
 
 导出的模型必须在 action decoder 中配置 RTC：
 
+RTC 的融合公式、异步时序与逐层调用链见 [RTC 原理与调用链](rtc_principle_and_call_flow.md)。
+
 ```json
 {
   "async_inference_plugin": {

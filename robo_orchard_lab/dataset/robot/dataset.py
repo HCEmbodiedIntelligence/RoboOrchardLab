@@ -968,7 +968,14 @@ class ROMultiRowDataset(RODataset):
             instruction: <class 'robo_orchard_lab.dataset.robot.db_orm.instruction.Instruction'>-shape: None
 
         """
+        # NOTE: cached_index_dataset 仅仅是保存了 index_dataset 的缓存，避免每次都去访问 frame_dataset 进行索引操作
+        # 实际数据保存在 frame_dataset 中，cached_index_dataset 只是为了加速索引操作
+        # frame_dataset column_names:
+        # ['joints', 'actions', 'head', 'head_depth', 'index', 'episode_index', 
+        # 'frame_index', 'task_index', 'robot_index', 'instruction_index', 
+        # 'timestamp_min', 'timestamp_max']
         cached_index_dataset = CachedIndexDataset(self.index_dataset)
+
 
         def fast_column_get(col_name: str, idx_rows: list[int | None]):
             col_dataset = self._column_datasets[col_name]

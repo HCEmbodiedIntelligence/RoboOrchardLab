@@ -139,6 +139,9 @@ class _HcTjArrowDataParse:
 
     def __call__(self, data: dict) -> dict:
         """Decode one metadata-materialized, multi-row hc_tj sample."""
+        #dict_keys(['joints', 'actions', 'head', 'head_depth', 'index', 
+        # 'frame_index', 'timestamp_min', 'timestamp_max', 'episode', 
+        # 'task', 'robot', 'instruction'])
         image, depth, intrinsic, zhi_to_eye_mat = self._camera(data)
         episode = data.get("episode")
         task = data.get("task")

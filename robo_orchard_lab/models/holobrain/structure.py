@@ -201,6 +201,8 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
             # 'hist_robot_state', 'kinematics', 'dataset_index'])
             # NOTE: data_preprocessor is <class 'robo_orchard_lab.models.layers.data_preprocessors.BaseDataPreprocessor'>
             # 用来处理输入数据, 例如归一化图像、生成掩码等.
+            # NOTE: infer 时，dict_keys(['imgs', 'depths', 'text', 'joint_mask', 'joint_scale_shift',
+            # 'image_wh', 'projection_mat', 'embodiedment_mat', 'hist_robot_state', 'kinematics'])
             inputs = self.data_preprocessor(inputs, device)
         if self.training:
             return self.loss(inputs)
@@ -214,6 +216,8 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
         # 'pred_mask', 'image_wh', 'projection_mat', 'embodiedment_mat',
         # 'pred_robot_state', 'hist_robot_state', 'kinematics', 'dataset_index',
         # 'origin_imgs', 'img_mean', 'img_std', 'depth_prob_gt', 'instruction'])
+        # projection_mat 相机内外参投影矩阵,当前头部 RGB 相机内参的 4×4 齐次扩展形式
+        # embodiedment_mat base_link → eye 的变换矩阵
         model_outs, _, text_dict, loss_depth = self._forward(inputs)
         loss = self.decoder.loss(model_outs, inputs, text_dict=text_dict)
         if loss_depth is not None:
@@ -350,6 +354,7 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
             )
         else:
             depth_prob = loss_depth = None
+        # DEBUG: HoloBrainActionDecoder
         model_outs = self.decoder(
             feature_maps=feature_maps,
             feature_3d=feature_3d,
