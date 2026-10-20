@@ -157,3 +157,7 @@ output_data: MultiArmManipulationOutput = pipeline(input_data)
       url={https://arxiv.org/abs/2602.12062}, 
 }
 ```
+
+## HC-TJ Grad-CAM
+
+使用 `scripts/eval_hc_tj_async.py --grad-cam-dir workspace/grad_cam` 可保存训练样本的动作归因热力图。完整命令与解释见 [HC-TJ Grad-CAM 使用说明](doc/hc_tj_grad_cam.md)。
