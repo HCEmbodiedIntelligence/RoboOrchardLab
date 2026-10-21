@@ -33,6 +33,7 @@ config = dict(
     lr=1e-4,
     training_with_subtask=False,
     with_cot=False,
+    prediction_type="relative_joint_relative_pose",
     training_datasets=[
         "robotwin2_0",
     ],
@@ -250,7 +251,9 @@ def build_model(config):
                     use_joint_mask=True,
                     noise_type="local_joint",
                     pred_scaled_joint=False,
-                    prediction_type="relative_joint_relative_pose",
+                    prediction_type=config.get(
+                        "prediction_type", "relative_joint_relative_pose"
+                    ),
                     pred_steps=config["pred_steps"],
                     state_dims=state_dims,
                     embed_dims=embed_dims,
