@@ -177,6 +177,101 @@ class TestTrajectoryAndSafety:
         _, clipped = hand_command(side, 2)
         assert np.allclose(clipped, closed)
 
+    @pytest.mark.parametrize(
+        ("side", "input_ranges", "output_ranges"),
+        [
+            (
+                "right",
+                [
+                    (0.4, 1.121),
+                    (-1.642, 0.045),
+                    (0.0, 1.0),
+                    (-0.13, -0.05),
+                    (0.0, 2.5),
+                    (0.0, 2.5),
+                    (0.05, 0.13),
+                    (0.0, 2.5),
+                    (0.05, 0.13),
+                    (0.0, 2.5),
+                ],
+                [
+                    (4096, 800),
+                    (4096, 0),
+                    (4096, 0),
+                    (4096, 0),
+                    (4096, 0),
+                    (4096, 0),
+                    (0, 4096),
+                    (4096, 0),
+                    (4096, 0),
+                    (4096, 0),
+                ],
+            ),
+            (
+                "left",
+                [
+                    (-0.4, -1.121),
+                    (-0.045, 1.642),
+                    (0.0, -1.0),
+                    (0.05, 0.13),
+                    (0.0, 2.5),
+                    (0.0, 2.5),
+                    (-0.13, -0.05),
+                    (0.0, 2.5),
+                    (-0.13, 0.05),
+                    (0.0, 2.5),
+                ],
+                [
+                    (4096, 800),
+                    (4096, 0),
+                    (4096, 0),
+                    (4096, 0),
+                    (4096, 0),
+                    (4096, 0),
+                    (0, 4096),
+                    (4096, 0),
+                    (4096, 0),
+                    (4096, 0),
+                ],
+            ),
+        ],
+    )
+    def test_omnihand_commands_match_driver_calibration(
+        self, side, input_ranges, output_ranges
+    ):
+        expected_open = np.asarray(
+            [3800, 4096, 4096, 1899, 4096, 4096, 4096, 4096, 0, 4096]
+        )
+        expected_fist = np.asarray(
+            [3800, 4096, 66, 1899, 2300, 2300, 1932, 604, 2094, 408]
+        )
+
+        def driver_motor_positions(command):
+            positions = []
+            for value, input_range, output_range in zip(
+                command, input_ranges, output_ranges, strict=True
+            ):
+                fraction = np.clip(
+                    (value - input_range[0])
+                    / (input_range[1] - input_range[0]),
+                    0.0,
+                    1.0,
+                )
+                positions.append(
+                    output_range[0]
+                    + fraction * (output_range[1] - output_range[0])
+                )
+            return np.asarray(positions)
+
+        _, open_command = hand_command(side, 0.0)
+        _, fist_command = hand_command(side, 1.0)
+        assert driver_motor_positions(open_command) == pytest.approx(
+            expected_open
+        )
+        assert driver_motor_positions(fist_command) == pytest.approx(
+            expected_fist
+        )
+
     def test_default_posture_matches_the_17_axis_control_order(self):
         assert len(DEFAULT_JOINT_POSITIONS) == len(CONTROL_JOINT_NAMES)
         assert CONTROL_JOINT_NAMES == (
@@ -222,16 +317,22 @@ class TestTrajectoryAndSafety:
 
 
 class TestObservationAndConfiguration:
-    def test_latest_joints_is_unavailable_until_first_feedback(self):
+    def test_latest_joints_preserves_local_receive_time(self, monkeypatch):
         buffer = ObservationBuffer()
 
         with pytest.raises(ValueError, match="feedback is unavailable"):
             buffer.latest_joints()
 
+        monotonic_values = iter((10.0, 20.0))
+        monkeypatch.setattr(
+            "projects.holobrain.scripts.hc_tj_async_client.time.monotonic",
+            lambda: next(monotonic_values),
+        )
         expected = np.arange(17, dtype=np.float64)
         buffer.add_joints(1_000_000_000, expected)
         latest = buffer.latest_joints()
         assert latest.timestamp_ns == 1_000_000_000
+        assert latest.received_monotonic_s == 10.0
         assert np.array_equal(latest.value, expected)
 
     def test_nearest_timestamp_prefers_earlier_and_enforces_tolerance(self):
@@ -297,7 +398,11 @@ class TestObservationAndConfiguration:
         buffer.add_color(1_000_000_000, b"jpeg")
         buffer.add_depth(1_049_000_000, b"png")
         buffer.add_joints(1_019_000_000, np.zeros(17))
-        assert buffer.synchronized()[0].timestamp_ns == 1_000_000_000
+        snapshot = buffer.synchronized()
+        assert len(snapshot) == 5
+        assert snapshot[0].timestamp_ns == 1_000_000_000
+        assert snapshot[1].timestamp_ns == 1_049_000_000
+        assert snapshot[2].timestamp_ns == 1_019_000_000
 
         config = HcTjAsyncClientConfig(
             server_url="http://localhost/holobrain/hc_tj_async/v1",
@@ -306,10 +411,21 @@ class TestObservationAndConfiguration:
             depth_units_per_meter=1000,
         )
         assert config.enable_control is False
+        assert config.camera_timeout_s == 1.0
+        assert config.color_topic == (
+            "/hc_teleop/camera_head/color/compressed"
+        )
+        assert config.depth_topic == (
+            "/hc_teleop/camera_head/depth/compressed"
+        )
+        assert config.joint_state_topic == "/hc_teleop/joint_states"
+        assert config.joint_command_topic == "/hc_teleop/joint_cmd"
+        assert config.right_hand_topic == ("/hc_teleop/joint_cmd_finger_right")
+        assert config.left_hand_topic == ("/hc_teleop/joint_cmd_finger_left")
 
     def test_state_timeout_boundary(self):
-        assert not _state_is_stale(1_250_000_000, 1_000_000_000, 0.25)
-        assert _state_is_stale(1_250_000_001, 1_000_000_000, 0.25)
+        assert not _state_is_stale(10.25, 10.0, 0.25)
+        assert _state_is_stale(10.250001, 10.0, 0.25)
 
     def test_competing_publisher_filter_excludes_only_self(self):
         infos = [

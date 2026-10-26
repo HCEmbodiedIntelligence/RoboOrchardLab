@@ -17,18 +17,19 @@
 import argparse
 import json
 import logging
-import os
 import sys
 import time
 from io import BytesIO
+from pathlib import Path
 from threading import Lock
 from typing import Any
 
-_REPO_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir)
-)
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+try:
+    sys.path.remove(str(_REPOSITORY_ROOT))
+except ValueError:
+    pass
+sys.path.insert(0, str(_REPOSITORY_ROOT))
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
@@ -456,4 +457,9 @@ def hc_tj_async_model_infer():
 
 if __name__ == "__main__":
     http_server = WSGIServer(("", args.port), app)
-    http_server.serve_forever()
+    try:
+        http_server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Model server %s stopped", args.server_name)
+    finally:
+        http_server.stop()

@@ -29,14 +29,17 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import requests
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
-if str(_REPOSITORY_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPOSITORY_ROOT))
+try:
+    sys.path.remove(str(_REPOSITORY_ROOT))
+except ValueError:
+    pass
+sys.path.insert(0, str(_REPOSITORY_ROOT))
 
 from projects.holobrain.scripts.hc_tj_async_core import (  # noqa: E402
     ACTION_HZ,
@@ -101,18 +104,19 @@ class HcTjAsyncClientConfig:
     inference_hz: float = 2.0
     control_hz: float = 100.0
     request_timeout_s: float = 30.0
+    camera_timeout_s: float = 1.0
     state_timeout_s: float = 0.25
     max_arm_velocity_rad_s: float = 0.25
     first_point_jump_rad: float = 0.10
     latency_ewma_alpha: float = 0.25
-    color_topic: str = "/io_teleop/camera_head/color"
-    depth_topic: str = "/io_teleop/camera_head/depth"
+    color_topic: str = "/hc_teleop/camera_head/color/compressed"
+    depth_topic: str = "/hc_teleop/camera_head/depth/compressed"
     calibration_topic: str = "/io_teleop/camera_head/calibration"
     extrinsics_topic: str = "/io_teleop/camera_head/extrinsics"
-    joint_state_topic: str = "/io_teleop/joint_states"
-    joint_command_topic: str = "/io_teleop/joint_cmd"
-    right_hand_topic: str = "/io_teleop/joint_cmd_finger_right"
-    left_hand_topic: str = "/io_teleop/joint_cmd_finger_left"
+    joint_state_topic: str = "/hc_teleop/joint_states"
+    joint_command_topic: str = "/hc_teleop/joint_cmd"
+    right_hand_topic: str = "/hc_teleop/joint_cmd_finger_right"
+    left_hand_topic: str = "/hc_teleop/joint_cmd_finger_left"
 
     def __post_init__(self) -> None:
         if not self.server_url.endswith("/hc_tj_async/v1"):
@@ -133,8 +137,10 @@ class HcTjAsyncClientConfig:
             raise ValueError(
                 "control_hz and request_timeout_s must be positive"
             )
-        if self.state_timeout_s <= 0 or self.max_arm_velocity_rad_s <= 0:
-            raise ValueError("state timeout and arm velocity must be positive")
+        if self.camera_timeout_s <= 0 or self.state_timeout_s <= 0:
+            raise ValueError("camera and state timeouts must be positive")
+        if self.max_arm_velocity_rad_s <= 0:
+            raise ValueError("arm velocity must be positive")
         if self.first_point_jump_rad <= 0:
             raise ValueError("first_point_jump_rad must be positive")
         if not 0 < self.latency_ewma_alpha <= 1:
@@ -155,12 +161,16 @@ class ObservationBuffer:
     def add_color(self, timestamp_ns: int, data: bytes) -> None:
         """Cache one JPEG payload under its message timestamp."""
         with self._lock:
-            self._colors.append(TimedValue(timestamp_ns, bytes(data)))
+            self._colors.append(
+                TimedValue(timestamp_ns, bytes(data), time.monotonic())
+            )
 
     def add_depth(self, timestamp_ns: int, data: bytes) -> None:
         """Cache one 16UC1 PNG payload under its message timestamp."""
         with self._lock:
-            self._depths.append(TimedValue(timestamp_ns, bytes(data)))
+            self._depths.append(
+                TimedValue(timestamp_ns, bytes(data), time.monotonic())
+            )
 
     def add_joints(self, timestamp_ns: int, positions: np.ndarray) -> None:
         """Cache one canonical 17-axis feedback sample."""
@@ -168,7 +178,9 @@ class ObservationBuffer:
         if values.shape != (17,) or not np.all(np.isfinite(values)):
             raise ValueError("joint feedback must be finite with shape [17]")
         with self._lock:
-            self._joints.append(TimedValue(timestamp_ns, values.copy()))
+            self._joints.append(
+                TimedValue(timestamp_ns, values.copy(), time.monotonic())
+            )
 
     def set_calibration(self, payload: str) -> None:
         """Validate and atomically replace the camera intrinsic matrix."""
@@ -216,7 +228,16 @@ class ObservationBuffer:
             if not self._joints:
                 raise ValueError("joint feedback is unavailable")
             latest = self._joints[-1]
-            return TimedValue(latest.timestamp_ns, latest.value.copy())
+            return TimedValue(
+                latest.timestamp_ns,
+                latest.value.copy(),
+                latest.received_monotonic_s,
+            )
+
+
+class _InferenceRequestConfig(Protocol):
+    instruction: str
+    depth_units_per_meter: float
 
 
 def _timestamp_ns(message: Any) -> int:
@@ -259,7 +280,7 @@ def _build_request(
     snapshot: tuple[
         TimedValue, TimedValue, TimedValue, np.ndarray, np.ndarray
     ],
-    config: HcTjAsyncClientConfig,
+    config: _InferenceRequestConfig,
     right_hand_observation: float,
     left_hand_observation: float,
     remaining_actions: np.ndarray | None,
@@ -315,11 +336,21 @@ def _post_inference(
     return validate_inference_response(response.json()), elapsed
 
 
-def _state_is_stale(now_ns: int, timestamp_ns: int, timeout_s: float) -> bool:
-    """Return whether feedback is older than the configured timeout."""
+def _state_is_stale(
+    now_monotonic_s: float,
+    received_monotonic_s: float,
+    timeout_s: float,
+) -> bool:
+    """Check freshness using only the receiving host's monotonic clock."""
     if timeout_s <= 0:
         raise ValueError("timeout_s must be positive")
-    return now_ns - timestamp_ns > timeout_s * 1_000_000_000
+    if not math.isfinite(now_monotonic_s) or not math.isfinite(
+        received_monotonic_s
+    ):
+        raise ValueError("monotonic timestamps must be finite")
+    if now_monotonic_s < received_monotonic_s:
+        raise ValueError("monotonic clock moved backwards")
+    return now_monotonic_s - received_monotonic_s > timeout_s
 
 
 def _other_publisher_names(
@@ -339,7 +370,12 @@ def _ros_node_class():
     """Load ROS only on the robot and return the concrete client node class."""
     try:
         from rclpy.node import Node
-        from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+        from rclpy.qos import (
+            DurabilityPolicy,
+            HistoryPolicy,
+            QoSProfile,
+            ReliabilityPolicy,
+        )
         from sensor_msgs.msg import CompressedImage, JointState
         from std_msgs.msg import String
     except ImportError as error:
@@ -373,6 +409,7 @@ def _ros_node_class():
             self._worker = ThreadPoolExecutor(max_workers=1)
             self._future: Future | None = None
             self._last_request = -math.inf
+            self._last_observation_timestamp_ns: int | None = None
             self._latency_ewma: float | None = None
             self._native_actions: np.ndarray | None = None
             self._native_started = 0.0
@@ -385,8 +422,15 @@ def _ros_node_class():
             self._reset_complete = not config.enable_control
             self._reset_limiter_initialized = False
 
-            reliable = QoSProfile(
-                depth=10, reliability=ReliabilityPolicy.RELIABLE
+            latest_reliable = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                history=HistoryPolicy.KEEP_LAST,
+            )
+            latest_best_effort = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
             )
             latched = QoSProfile(
                 depth=1,
@@ -394,13 +438,22 @@ def _ros_node_class():
                 durability=DurabilityPolicy.TRANSIENT_LOCAL,
             )
             self.create_subscription(
-                CompressedImage, config.color_topic, self._on_color, reliable
+                CompressedImage,
+                config.color_topic,
+                self._on_color,
+                latest_best_effort,
             )
             self.create_subscription(
-                CompressedImage, config.depth_topic, self._on_depth, reliable
+                CompressedImage,
+                config.depth_topic,
+                self._on_depth,
+                latest_best_effort,
             )
             self.create_subscription(
-                JointState, config.joint_state_topic, self._on_joints, reliable
+                JointState,
+                config.joint_state_topic,
+                self._on_joints,
+                latest_reliable,
             )
             self.create_subscription(
                 String, config.calibration_topic, self._on_calibration, latched
@@ -414,13 +467,17 @@ def _ros_node_class():
             self._left_hand_publisher = None
             if config.enable_control:
                 self._joint_publisher = self.create_publisher(
-                    JointState, config.joint_command_topic, reliable
+                    JointState, config.joint_command_topic, latest_reliable
                 )
                 self._right_hand_publisher = self.create_publisher(
-                    JointState, config.right_hand_topic, reliable
+                    JointState,
+                    config.right_hand_topic,
+                    latest_best_effort,
                 )
                 self._left_hand_publisher = self.create_publisher(
-                    JointState, config.left_hand_topic, reliable
+                    JointState,
+                    config.left_hand_topic,
+                    latest_best_effort,
                 )
             else:
                 self.get_logger().warning(
@@ -513,8 +570,8 @@ def _ros_node_class():
                         )
                     feedback_sample = self.observations.latest_joints()
                     if _state_is_stale(
-                        int(self.get_clock().now().nanoseconds),
-                        feedback_sample.timestamp_ns,
+                        time.monotonic(),
+                        feedback_sample.received_monotonic_s,
                         self.config.state_timeout_s,
                     ):
                         raise ValueError("joint feedback is stale")
@@ -550,13 +607,14 @@ def _ros_node_class():
                 snapshot = self.observations.synchronized()
             except ValueError:
                 return
-            ros_now_ns = int(self.get_clock().now().nanoseconds)
             if _state_is_stale(
-                ros_now_ns,
-                snapshot[0].timestamp_ns,
-                self.config.state_timeout_s,
+                time.monotonic(),
+                snapshot[0].received_monotonic_s,
+                self.config.camera_timeout_s,
             ):
                 self._latch_fault("synchronized camera observation is stale")
+                return
+            if snapshot[0].timestamp_ns == self._last_observation_timestamp_ns:
                 return
             remaining = self._remaining_actions(now)
             with self._lock:
@@ -579,6 +637,7 @@ def _ros_node_class():
                 self._latch_fault(f"observation/protocol failure: {error}")
                 return
             self._last_request = now
+            self._last_observation_timestamp_ns = snapshot[0].timestamp_ns
             self._future = self._worker.submit(
                 _post_inference, self.config, files, form
             )
@@ -611,10 +670,9 @@ def _ros_node_class():
                 # subsequent stale or non-finite data is still a latched fault.
                 return
             try:
-                ros_now_ns = int(self.get_clock().now().nanoseconds)
                 if _state_is_stale(
-                    ros_now_ns,
-                    feedback_sample.timestamp_ns,
+                    time.monotonic(),
+                    feedback_sample.received_monotonic_s,
                     self.config.state_timeout_s,
                 ):
                     raise ValueError("joint feedback is stale")
@@ -715,23 +773,24 @@ def _parse_args() -> HcTjAsyncClientConfig:
     parser.add_argument("--allow-competing-publishers", action="store_true")
     parser.add_argument("--inference-hz", type=float, default=2.0)
     parser.add_argument("--request-timeout-s", type=float, default=30.0)
+    parser.add_argument("--camera-timeout-s", type=float, default=1.0)
     parser.add_argument("--state-timeout-s", type=float, default=0.25)
     for name, default in (
-        ("color-topic", "/io_teleop/camera_head/color"),
-        ("depth-topic", "/io_teleop/camera_head/depth"),
+        ("color-topic", "/hc_teleop/camera_head/color/compressed"),
+        ("depth-topic", "/hc_teleop/camera_head/depth/compressed"),
         ("calibration-topic", "/io_teleop/camera_head/calibration"),
         ("extrinsics-topic", "/io_teleop/camera_head/extrinsics"),
-        ("joint-state-topic", "/io_teleop/joint_states"),
-        ("joint-command-topic", "/io_teleop/joint_cmd"),
-        ("right-hand-topic", "/io_teleop/joint_cmd_finger_right"),
-        ("left-hand-topic", "/io_teleop/joint_cmd_finger_left"),
+        ("joint-state-topic", "/hc_teleop/joint_states"),
+        ("joint-command-topic", "/hc_teleop/joint_cmd"),
+        ("right-hand-topic", "/hc_teleop/joint_cmd_finger_right"),
+        ("left-hand-topic", "/hc_teleop/joint_cmd_finger_left"),
     ):
         parser.add_argument(f"--{name}", default=default)
     return HcTjAsyncClientConfig(**vars(parser.parse_args()))
 
 
 def main() -> None:
-    """Run the ROS executor in a background thread until interrupted."""
+    """Run the ROS executor until interrupted."""
     config = _parse_args()
     try:
         import rclpy
@@ -745,18 +804,17 @@ def main() -> None:
     node = node_class(config)
     executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
-    executor_thread = threading.Thread(target=executor.spin, daemon=True)
-    executor_thread.start()
     try:
-        while rclpy.ok():
-            time.sleep(0.2)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
         executor.shutdown()
-        executor_thread.join(timeout=2)
         node.destroy_node()
-        rclpy.shutdown()
+        # rclpy's SIGINT handler may already have shut down the default
+        # context before control reaches this block.
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
