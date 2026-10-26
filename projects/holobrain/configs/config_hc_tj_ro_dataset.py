@@ -41,7 +41,7 @@ _DATASET_PATH = (
     Path(__file__).resolve().parents[1]
     / "data"
     / "arrow_dataset"
-    / "hc_tj_260818_fix"
+    / "hc_tj_260902_test"
 )
 _ARM_ONLY_DATASET_PATH = (
     Path(__file__).resolve().parents[1] / "data" / "arrow_dataset" / "hc_tj"
@@ -207,6 +207,7 @@ def build_transforms(config, mode, data_config):
         UnsqueezeBatch,
     )
 
+    # NOTE:1维关节值 + 3维位置 + 4维四元数
     arm_state_weight = [1.0, 1.0, 1.0, 1.0, 0.1, 0.1, 0.1, 0.1]
     gripper_state_weight = [1.0, 2.0, 2.0, 2.0, 0.2, 0.2, 0.2, 0.2]
     if data_config["has_grippers"]:

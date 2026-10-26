@@ -14,6 +14,7 @@
 # implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
+
 import argparse
 import json
 import logging
@@ -208,9 +209,38 @@ def _infer_hc_tj_async(request_data: dict[str, Any]) -> dict[str, Any]:
             "remaining_actions requires the loaded model to configure "
             "RTCInferencePlugin"
         )
+    grad_cam = request_data.get("grad_cam", "false")
+    if grad_cam not in ("true", "false"):
+        raise ProtocolError("grad_cam must be true or false")
+    selectors = {}
+    for name, upper in (("joint", 16), ("step", ACTION_HORIZON)):
+        value = request_data.get(f"grad_cam_{name}")
+        if value is not None:
+            try:
+                index = int(value)
+            except (TypeError, ValueError) as error:
+                raise ProtocolError(
+                    f"grad_cam_{name} must be an integer"
+                ) from error
+            if str(index) != str(value) or not 0 <= index < upper:
+                raise ProtocolError(f"grad_cam_{name} must be in [0, {upper})")
+            if grad_cam != "true":
+                raise ProtocolError("Grad-CAM selectors require grad_cam=true")
+            selectors[name] = index
     start_time = time.perf_counter()
-    with _pipeline_lock, torch.inference_mode():
-        output = pipeline(model_input)
+    explanation = None
+    with _pipeline_lock:
+        if grad_cam == "true":
+            from projects.holobrain.scripts.hc_tj_grad_cam import (
+                infer_with_grad_cam,
+            )
+
+            output, explanation = infer_with_grad_cam(
+                pipeline, model_input, **selectors
+            )
+        else:
+            with torch.inference_mode():
+                output = pipeline(model_input)
     inference_ms = (time.perf_counter() - start_time) * 1000
     actions = torch.as_tensor(output.action).detach().cpu().numpy()
     if (
@@ -230,6 +260,7 @@ def _infer_hc_tj_async(request_data: dict[str, Any]) -> dict[str, Any]:
         "action_hz": ACTION_HZ,
         "action_horizon": len(actions),
         "inference_ms": inference_ms,
+        **({"grad_cam": explanation} if explanation is not None else {}),
     }
 
 

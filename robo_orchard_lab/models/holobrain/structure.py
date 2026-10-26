@@ -14,7 +14,6 @@
 # implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
-import logging
 import os
 from typing import Optional
 
@@ -43,9 +42,6 @@ __all__ = [
     "HoloBrain_Qwen2_5_VL",
     "HoloBrain_Qwen2_5_VLConfig",
 ]
-
-
-logger = logging.getLogger(__name__)
 
 
 class TextTemplate(nn.Module):
@@ -114,26 +110,21 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
                 attn_implementation="flash_attention_2",
                 torch_dtype=torch.bfloat16,
             )
-        if not hasattr(self.vlm, "language_model"):
-            logger.warning("Deprecated, please use `transformers` >= 4.57.1.")
-            self.vlm.language_model = self.vlm.model
-            self.vlm.model.get_rope_index = self.vlm.get_rope_index
-
         if self.cfg.freeze_vlm:
             self.vlm.eval()
             self.vlm.requires_grad_(False)
         else:
             # self.vlm.language_model.gradient_checkpointing_enable()
             if self.cfg.freeze_vision:
-                self.vlm.visual.eval()
-                self.vlm.visual.requires_grad_(False)
+                self._vlm_visual.eval()
+                self._vlm_visual.requires_grad_(False)
 
-        origin_num_layers = len(self.vlm.language_model.layers)
+        origin_num_layers = len(self._vlm_language_model.layers)
         if (
             self.cfg.num_vlm_layers is not None
             and self.cfg.num_vlm_layers >= 0
         ):
-            self.vlm.language_model.layers = self.vlm.language_model.layers[
+            self._vlm_language_model.layers = self._vlm_language_model.layers[
                 : self.cfg.num_vlm_layers
             ]
 
@@ -144,12 +135,12 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
         self.feat_mapping = torch.nn.ModuleList(
             [
                 torch.nn.Linear(
-                    self.vlm.language_model.config.hidden_size,
+                    self._vlm_language_model.config.hidden_size,
                     self.decoder.embed_dims,
                     bias=True,
                     dtype=torch.bfloat16,
                 )
-                for _ in range(len(self.vlm.language_model.layers) + 1)
+                for _ in range(len(self._vlm_language_model.layers) + 1)
             ]
         )
         temperature = 3
@@ -159,13 +150,27 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
                 torch.linspace(0.1, 1, highlighted_layer + 1),
                 torch.linspace(1, 0.1, origin_num_layers - highlighted_layer),
             ]
-        )[: len(self.vlm.language_model.layers) + 1]
+        )[: len(self._vlm_language_model.layers) + 1]
         weight = weight.to(dtype=torch.bfloat16) * temperature
         self.weight = torch.nn.Parameter(weight, requires_grad=True)
         self.qwen_patch_size = (
             self.vlm.config.vision_config.patch_size
             * self.vlm.config.vision_config.spatial_merge_size
         )
+
+    @property
+    def _vlm_language_model(self):
+        """Return the Qwen language model without registering an alias."""
+        if hasattr(self.vlm.model, "language_model"):
+            return self.vlm.model.language_model
+        return self.vlm.model
+
+    @property
+    def _vlm_visual(self):
+        """Return the Qwen vision encoder across supported layouts."""
+        if hasattr(self.vlm.model, "visual"):
+            return self.vlm.model.visual
+        return self.vlm.visual
 
     def save_model(
         self, directory: str, model_prefix: str = "model", **kwargs
@@ -189,11 +194,15 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
     def forward(self, inputs):
         if self.data_preprocessor is not None:
             device = next(self.parameters()).device
-            # dict_keys(['uuid', 'imgs', 'depths', 'text',
-            # 'state_loss_weights', 'fk_loss_weight', 'joint_mask',
-            # 'image_wh', 'projection_mat', 'embodiedment_mat',
-            # 'joint_scale_shift', 'pred_robot_state', 'hist_robot_state',
-            # 'kinematics', 'origin_imgs', 'img_mean', 'img_std', 'depth_prob_gt', 'instruction'])
+            #input dict_keys(
+            # ['text', 'imgs', 'depths', 'uuid', 'joint_mask', 'joint_scale_shift',
+            # 'state_loss_weights', 'fk_loss_weight', 'pred_mask', 'image_wh',
+            # 'projection_mat', 'embodiedment_mat', 'pred_robot_state',
+            # 'hist_robot_state', 'kinematics', 'dataset_index'])
+            # NOTE: data_preprocessor is <class 'robo_orchard_lab.models.layers.data_preprocessors.BaseDataPreprocessor'>
+            # 用来处理输入数据, 例如归一化图像、生成掩码等.
+            # NOTE: infer 时，dict_keys(['imgs', 'depths', 'text', 'joint_mask', 'joint_scale_shift',
+            # 'image_wh', 'projection_mat', 'embodiedment_mat', 'hist_robot_state', 'kinematics'])
             inputs = self.data_preprocessor(inputs, device)
         if self.training:
             return self.loss(inputs)
@@ -201,6 +210,14 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
             return self.predict(inputs)
 
     def loss(self, inputs):
+        # NOTE: inputs keys:
+        #dict_keys(['text', 'imgs', 'depths', 'uuid', 'joint_mask',
+        # 'joint_scale_shift', 'state_loss_weights', 'fk_loss_weight',
+        # 'pred_mask', 'image_wh', 'projection_mat', 'embodiedment_mat',
+        # 'pred_robot_state', 'hist_robot_state', 'kinematics', 'dataset_index',
+        # 'origin_imgs', 'img_mean', 'img_std', 'depth_prob_gt', 'instruction'])
+        # projection_mat 相机内外参投影矩阵,当前头部 RGB 相机内参的 4×4 齐次扩展形式
+        # embodiedment_mat base_link → eye 的变换矩阵
         model_outs, _, text_dict, loss_depth = self._forward(inputs)
         loss = self.decoder.loss(model_outs, inputs, text_dict=text_dict)
         if loss_depth is not None:
@@ -337,6 +354,7 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
             )
         else:
             depth_prob = loss_depth = None
+        # DEBUG: HoloBrainActionDecoder
         model_outs = self.decoder(
             feature_maps=feature_maps,
             feature_3d=feature_3d,
@@ -354,6 +372,7 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
         attention_mask=None,
         pixel_values=None,
         image_grid_thw=None,
+        mm_token_type_ids=None,
     ):
         """将 input_ids 转成文本 embedding, 并调用 VLM 前向.
 
@@ -361,14 +380,16 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
         2. 用视觉编码器提取 image_embeds;
         3. 将 prompt 中 image_token 对应位置替换为图像特征;
         4. 计算多模态 RoPE 的 position_ids;
-        5. 调用 self.vlm.language_model(...) 一次,要求返回所有层隐藏状态.
+        5. 调用语言模型一次,要求返回所有层隐藏状态.
         """
-        inputs_embeds = self.vlm.language_model.embed_tokens(input_ids)
+        inputs_embeds = self._vlm_language_model.embed_tokens(input_ids)
         if pixel_values is not None:
-            pixel_values = pixel_values.type(self.vlm.visual.dtype)
-            image_embeds = self.vlm.visual(
+            pixel_values = pixel_values.type(self._vlm_visual.dtype)
+            image_embeds = self._vlm_visual(
                 pixel_values, grid_thw=image_grid_thw
             )
+            if hasattr(image_embeds, "pooler_output"):
+                image_embeds = image_embeds.pooler_output
             n_image_tokens = (
                 (input_ids == self.vlm.config.image_token_id).sum().item()
             )
@@ -394,13 +415,27 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
         if attention_mask is not None:
             attention_mask = attention_mask.to(inputs_embeds.device)
 
-        position_ids, _rope_deltas = self.vlm.model.get_rope_index(
-            input_ids,
-            image_grid_thw=image_grid_thw,
-            attention_mask=attention_mask,
-        )
+        if not hasattr(self.vlm, "language_model"):
+            # transformers > 4.57.1
+            if mm_token_type_ids is None:
+                mm_token_type_ids = torch.zeros_like(input_ids)
+                mm_token_type_ids[
+                    input_ids == self.vlm.config.image_token_id
+                ] = 1
+            position_ids, _rope_deltas = self.vlm.model.get_rope_index(
+                input_ids,
+                mm_token_type_ids=mm_token_type_ids,
+                image_grid_thw=image_grid_thw,
+                attention_mask=attention_mask,
+            )
+        else:
+            position_ids, _rope_deltas = self.vlm.model.get_rope_index(
+                input_ids,
+                image_grid_thw=image_grid_thw,
+                attention_mask=attention_mask,
+            )
 
-        outputs = self.vlm.language_model(
+        outputs = self._vlm_language_model(
             input_ids=None,
             position_ids=position_ids,
             attention_mask=attention_mask,
@@ -423,7 +458,7 @@ class HoloBrain_Qwen2_5_VL(ModelMixin):  # noqa: N801
         # (ar_times, num_layers + 1, batch_size, seq, hidden_size)
         hidden_states = outputs.hidden_states
         # + 1 for the input embeddings
-        num_hidden_states = len(self.vlm.language_model.layers) + 1
+        num_hidden_states = len(self._vlm_language_model.layers) + 1
         cated_hidden_states = []
         for i in range(num_hidden_states):
             hs_i = torch.cat([h[i] for h in hidden_states], dim=1)

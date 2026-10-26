@@ -54,48 +54,62 @@ OpenCV。JPEG 与 16UC1 PNG 保持压缩格式跨机传输，在 GPU 主机解�
 Joint1_R..Joint7_R, R_ban, Joint1_L..Joint7_L, L_ban
 ```
 
-## 接口与安全边界
+客户端在 100 Hz 控制周期内插值、限位和限速。默认是 dry-run；只有显式加入
+`--enable-control` 才会创建命令 publisher。
 
-机器人网关仅在机器人本机订阅这些现有接口：
+启用控制后，客户端会先将 17 轴主关节复位到内置默认姿态，再开始发送正式推理
+请求。复位顺序为 `Joint1_R..Joint7_R, Joint1_L..Joint7_L, leg_1, leg_2, zhi`；
+双臂以已配置的速度限制逐步靠近目标，反馈在每轴距离目标不超过 `0.02 rad` 前，
+不会调用推理服务。手部不会在复位阶段发布命令。
 
-```text
-/hc_teleop/camera_head/color/compressed
-/hc_teleop/camera_head/depth/compressed
-/hc_teleop/joint_states
-/io_teleop/camera_head/calibration
-/io_teleop/camera_head/extrinsics
+## 前置安全条件
+
+- 物理急停必须可触达，并安排一名操作员专门负责急停。
+- 启动前清空机械臂和双手工作区，确认头部 `head_1=head_2=0 rad`。当前静态
+  `zhi_Link→eye` 外参不支持头部运动。
+- 停止 VR、IK、示教器等其他命令源。客户端会检查主关节和左右手三个命令
+  话题；发现其他 publisher 会锁存故障并停发。
+- `--allow-competing-publishers` 仅用于隔离调试，禁止在正常真机运行中使用。
+- 故障不会自动恢复。排查原因、确认机器人安全后重启客户端。
+
+## GPU 服务端
+
+服务端继续保留旧的 `/{server_name}` 接口。HC-TJ 异步客户端只连接版本化端点
+`/{server_name}/hc_tj_async/v1`。新端点接收 multipart `.npy`：
+
+| 字段 | 契约 |
+| --- | --- |
+| `head_color` | `uint8 [H,W,3]`，与 Arrow/OpenCV 训练读取一致的 BGR |
+| `head_depth` | `float32/float64 [H,W]`，单位米 |
+| `head_intrinsic` | 有限 `float32/float64 [4,4]` |
+| `zhi_to_eye` | 有限齐次 `float32/float64 [4,4]`，`zhi_Link→eye` |
+| `current_state` | `float32 [16]`，严格使用上述关节顺序 |
+| `joint_names` | 上述 16 个名字的 JSON 数组 |
+| `instruction` | 非空字符串 |
+| `remaining_actions` | 可选 `float32 [N,16]`，原生 30 Hz |
+| `delay_horizon` | 有剩余动作时必需，`0..N` 的整数 |
+
+响应包含 `actions [N,16]`、`joint_names`、`action_hz=30`、
+`action_horizon` 和 `inference_ms`。服务端不会插值。共享 pipeline 串行执行。
+
+导出的模型必须在 action decoder 中配置 RTC：
+
+RTC 的融合公式、异步时序与逐层调用链见 [RTC 原理与调用链](rtc_principle_and_call_flow.md)。
+
+```json
+{
+  "async_inference_plugin": {
+    "type": "robo_orchard_lab.models.rtc_plugin.rtc_plugin:RTCInferencePlugin",
+    "max_horizon": 32
+  }
+}
 ```
 
-启用控制后才创建以下 publisher：
+HC-TJ 配置会把该字段导出到 `model/model.config.json` 的 decoder 配置。部署前先重新
+加载导出 pipeline 验证配置；当请求带 `remaining_actions` 而模型未启用 RTC 时，
+新端点会明确返回协议错误。
 
-```text
-/hc_teleop/joint_cmd
-/hc_teleop/joint_cmd_finger_right
-/hc_teleop/joint_cmd_finger_left
-```
-
-HTTP API 使用 Bearer token，包括二进制观测 `GET
-/hc_tj/observation/v1`、最新关节反馈 `GET /hc_tj/joint_feedback/v1`、动作块
-`POST /hc_tj/action_chunk/v1` 和只读健康检查 `GET /healthz`。生产部署应再用
-防火墙限制 8765 端口只能由 GPU 主机访问；HTTP
-明文只适合受控机器人局域网，跨不可信网络必须加 TLS/VPN。
-
-客户端在每次推理完成后重新读取最新关节反馈，再检查预测首点与双臂反馈差值；
-机器人网关在接收动作时会用自己的最新反馈重复执行同一项独立检查。控制侧还会
-检查：关节反馈新鲜度、动作有限值和维度、URDF 位置限位、每轴速度限制、动作序号
-递增、轨迹耗尽，以及其他命令 publisher。网关仅在首次控制和 deadman 暂停恢复时
-用最新反馈初始化限速器；正常 RTC 动作块更新会保留上一条已发布命令，避免周期性
-回拉到存在跟踪延迟的反馈位置。
-动作流还带有默认 0.75 秒软件 deadman；客户端或网络失联后会立即清空旧轨迹并
-进入 `control_state=paused`，但不会锁存全局 fault。客户端收到暂停响应后会丢弃
-尚未执行的旧动作和 RTC 续接状态，自动用下一帧最新观测重新推理，并从
-`sequence_id=1` 建立新会话；新动作重新通过最新反馈、首点连续性、URDF 和限速
-检查后才能恢复。关节反馈异常、竞争 publisher 等其他安全故障仍会锁存，必须
-排查并重启网关。
-
-## 1. 启动 GPU 推理服务
-
-在 GPU 主机、项目虚拟环境中执行：
+在 GPU 主机执行：
 
 ```bash
 conda activate ./<environment-dir>
@@ -202,16 +216,28 @@ HoloBrain。正常日志会持续显示 observation id、推理延迟和剩余�
 控制参数：
 
 ```bash
-/usr/bin/python3 \
-  "$HOME/holobrain_http_gateway/projects/holobrain/scripts/hc_tj_http_robot_gateway.py" \
-  --host 0.0.0.0 \
-  --port 8765 \
-  --enable-control \
-  --urdf-path "$HOME/holobrain_http_gateway/hc_tj_robot.urdf"
+python projects/holobrain/scripts/replay_hc_tj_async.py \
+  --dataset-path projects/holobrain/data/arrow_dataset/hc_tj_260818_fix
 ```
 
-确认 `/healthz` 返回 `control_enabled=true` 且没有其他命令 publisher 后，GPU
-客户端才加入第二道开关：
+回放只使用 `/holobrain_hc_tj_replay/*`，绝不连接真机控制话题。它验证 100 Hz
+双臂命令、腰部反馈保持、左右完整 10 关节 OmniHand 映射和故障停发。
+回放取一个 Arrow 样本的图像和初始双臂状态，以模拟关节反馈跟随客户端命令
+完成启动复位，随后使用本地模拟推理服务产生动作并执行上述检查；不会逐帧
+播放数据集中记录的动作。复位命令不计入推理阶段的命令数量或频率检查。
+
+## 逐级启用
+
+1. 完成 Arrow 离线请求和隔离 ROS 回放。
+2. 真机保持急停可触达、工作区清空，运行 dry-run；确认没有其他控制 publisher。
+3. 检查当前双臂反馈与每段预测首点差值小于 `0.10 rad`。
+4. 加入 `--enable-control`。客户端会先复位到内置默认姿态；默认双臂每关节每
+   周期限速对应 `0.25 rad/s`，并应用 HC-TJ URDF 位置限位。确认复位完成日志后，
+   才会开始正式推理。
+5. 首次只允许单关节小幅目标，确认方向、单位、左右顺序和腰部保持。
+6. 再逐步允许双臂和二值手部动作；全程保留物理急停和控制源互斥。
+
+启用命令仅比 dry-run 多一个参数：
 
 ```bash
 python projects/holobrain/scripts/hc_tj_http_async_client.py \

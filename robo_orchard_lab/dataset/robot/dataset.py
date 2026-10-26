@@ -953,7 +953,29 @@ class ROMultiRowDataset(RODataset):
         return ret
 
     def __getitem_no_transform__(self, index: int | slice | list[int]) -> dict:
+        """
+            joints: <class 'list'>-shape: (65,)
+            actions: <class 'list'>-shape: (65,)
+            head: <class 'robo_orchard_core.datatypes.camera_data.BatchCameraDataEncoded'>-shape: None
+            head_depth: <class 'robo_orchard_core.datatypes.camera_data.BatchCameraDataEncoded'>-shape: None
+            index: <class 'int'>-shape: None
+            frame_index: <class 'int'>-shape: None
+            timestamp_min: <class 'int'>-shape: None
+            timestamp_max: <class 'int'>-shape: None
+            episode: <class 'robo_orchard_lab.dataset.robot.db_orm.episode.Episode'>-shape: None
+            task: <class 'robo_orchard_lab.dataset.robot.db_orm.task.Task'>-shape: None
+            robot: <class 'robo_orchard_lab.dataset.robot.db_orm.robot.Robot'>-shape: None
+            instruction: <class 'robo_orchard_lab.dataset.robot.db_orm.instruction.Instruction'>-shape: None
+
+        """
+        # NOTE: cached_index_dataset 仅仅是保存了 index_dataset 的缓存，避免每次都去访问 frame_dataset 进行索引操作
+        # 实际数据保存在 frame_dataset 中，cached_index_dataset 只是为了加速索引操作
+        # frame_dataset column_names:
+        # ['joints', 'actions', 'head', 'head_depth', 'index', 'episode_index', 
+        # 'frame_index', 'task_index', 'robot_index', 'instruction_index', 
+        # 'timestamp_min', 'timestamp_max']
         cached_index_dataset = CachedIndexDataset(self.index_dataset)
+
 
         def fast_column_get(col_name: str, idx_rows: list[int | None]):
             col_dataset = self._column_datasets[col_name]
@@ -1139,6 +1161,11 @@ class ConcatRODataset(TorchDataset):
             dataset_idx, sample_idx = self._map_index_to_dataset(index)
             ret = self.datasets[dataset_idx][sample_idx]
             ret[self.dataset_index_key] = dataset_idx
+            # ret key: 
+            # dict_keys(['text', 'imgs', 'depths', 'uuid', 'joint_mask', 
+            # 'joint_scale_shift', 'state_loss_weights', 'fk_loss_weight', 
+            # 'pred_mask', 'image_wh', 'projection_mat', 'embodiedment_mat', 
+            # 'pred_robot_state', 'hist_robot_state', 'kinematics', 'dataset_index'])
             return ret
 
         elif isinstance(index, list):

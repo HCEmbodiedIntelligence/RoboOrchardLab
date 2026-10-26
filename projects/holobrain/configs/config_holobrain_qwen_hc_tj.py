@@ -41,8 +41,8 @@ __all__ = [
 
 config = copy.deepcopy(_common_config)
 config.update(
-    training_datasets=["hc_tj_14dof"],
-    deploy_datasets=["hc_tj_14dof"],
+    training_datasets=["hc_tj"],
+    deploy_datasets=["hc_tj"],
     batch_size=1,
     step_log_freq=50,
     save_step_freq=5000,

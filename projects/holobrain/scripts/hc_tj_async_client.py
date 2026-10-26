@@ -29,7 +29,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, Callable
 
 import numpy as np
 import requests
@@ -322,7 +322,14 @@ def _post_inference(
     config: HcTjAsyncClientConfig,
     files: dict[str, tuple[str, bytes, str]],
     form: dict[str, str],
+    *,
+    response_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[np.ndarray, float]:
+    """Post one request and optionally observe its validated response.
+
+    The callback runs in the request worker before returning actions. Its
+    exceptions propagate through the normal inference fault handling.
+    """
     start = time.monotonic()
     response = requests.post(
         config.server_url,
@@ -333,7 +340,12 @@ def _post_inference(
     elapsed = time.monotonic() - start
     if not response.ok:
         raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
-    return validate_inference_response(response.json()), elapsed
+    payload = response.json()
+    actions = validate_inference_response(payload)
+    if response_callback is not None:
+        response_callback(payload)
+        elapsed = time.monotonic() - start
+    return actions, elapsed
 
 
 def _state_is_stale(
@@ -639,8 +651,16 @@ def _ros_node_class():
             self._last_request = now
             self._last_observation_timestamp_ns = snapshot[0].timestamp_ns
             self._future = self._worker.submit(
-                _post_inference, self.config, files, form
+                self._request_inference, files, form
             )
+
+        def _request_inference(
+            self,
+            files: dict[str, tuple[str, bytes, str]],
+            form: dict[str, str],
+        ) -> tuple[np.ndarray, float]:
+            """Execute HTTP in the worker; subclasses may observe responses."""
+            return _post_inference(self.config, files, form)
 
         def _other_publishers(self, topic: str) -> list[str]:
             return _other_publisher_names(

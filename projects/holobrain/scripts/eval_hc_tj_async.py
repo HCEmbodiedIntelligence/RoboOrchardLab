@@ -100,15 +100,59 @@ def _hand_metrics(
     }
 
 
+def _save_grad_cam(sample, payload, output_dir: Path, sample_index: int) -> dict:
+    """Save the returned spatial map and its overlay on the source RGB image."""
+    from PIL import Image
+
+    explanation = payload.get("grad_cam")
+    if not isinstance(explanation, dict) or "head" not in explanation:
+        raise RuntimeError("Server did not return Grad-CAM; restart the updated server")
+    heatmap = np.asarray(explanation["head"], dtype=np.float32)
+    if (heatmap.ndim != 2 or not heatmap.size
+            or not np.isfinite(heatmap).all()
+            or heatmap.min() < 0 or heatmap.max() > 1):
+        raise ValueError("Server returned an invalid Grad-CAM heatmap")
+    rgb = np.asarray(sample["imgs"][0], dtype=np.uint8)
+    original = Image.fromarray(rgb)
+    resized = np.asarray(
+        Image.fromarray(heatmap).resize(original.size, Image.Resampling.BILINEAR)
+    )
+    # Red/yellow highlights with opacity proportional to positive attribution.
+    color = np.zeros_like(rgb, dtype=np.float32)
+    color[..., 0] = 255
+    color[..., 1] = 255 * (1 - resized)
+    alpha = 0.6 * resized[..., None]
+    overlay = np.clip(rgb * (1 - alpha) + color * alpha, 0, 255).astype(np.uint8)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = output_dir / f"sample_{sample_index:06d}_head"
+    original.save(f"{stem}_rgb.png")
+    Image.fromarray(overlay).save(f"{stem}_grad_cam.png")
+    np.save(f"{stem}_grad_cam.npy", heatmap, allow_pickle=False)
+    metadata = {key: value for key, value in explanation.items() if key != "head"}
+    metadata.update(
+        overlay=f"{stem}_grad_cam.png", heatmap=f"{stem}_grad_cam.npy",
+        original=f"{stem}_rgb.png", empty=bool(not heatmap.any()),
+    )
+    Path(f"{stem}_grad_cam.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return metadata
+
+
 def evaluate_hc_tj_inference_server(
     server_url: str,
     dataset_path: Path = DEFAULT_DATASET_PATH,
     sample_indices: tuple[int, ...] = (0, 300, 600),
     timeout_seconds: float = 300,
+    grad_cam_dir: Path | None = None,
+    grad_cam_joint: int | None = None,
+    grad_cam_step: int | None = None,
 ) -> dict[str, Any]:
     """Call v1 and report protocol, accuracy, and latency metrics."""
     from robo_orchard_lab.dataset.hc_tj import HcTjRODataset
 
+    if grad_cam_dir is None and (grad_cam_joint is not None or grad_cam_step is not None):
+        raise ValueError("Grad-CAM selectors require grad_cam_dir")
     if not (dataset_path / "state.json").is_file():
         raise FileNotFoundError(f"converted dataset not found: {dataset_path}")
     dataset = HcTjRODataset(
@@ -118,6 +162,12 @@ def evaluate_hc_tj_inference_server(
     for sample_index in sample_indices:
         sample = dataset[sample_index]
         files, form = _request(sample)
+        if grad_cam_dir is not None:
+            form["grad_cam"] = "true"
+            if grad_cam_joint is not None:
+                form["grad_cam_joint"] = str(grad_cam_joint)
+            if grad_cam_step is not None:
+                form["grad_cam_step"] = str(grad_cam_step)
         started = time.monotonic()
         response = requests.post(
             server_url, files=files, data=form, timeout=timeout_seconds
@@ -129,6 +179,10 @@ def evaluate_hc_tj_inference_server(
             )
         payload = response.json()
         prediction = validate_inference_response(payload)
+        visualization = (
+            _save_grad_cam(sample, payload, grad_cam_dir, sample_index)
+            if grad_cam_dir is not None else None
+        )
         target = np.asarray(
             sample["master_joint_state"][1 : 1 + len(prediction)],
             dtype=np.float32,
@@ -142,6 +196,7 @@ def evaluate_hc_tj_inference_server(
         reports.append(
             {
                 "sample_index": sample_index,
+                **({"grad_cam": visualization} if visualization is not None else {}),
                 "protocol": {
                     "shape": list(prediction.shape),
                     "joint_order_ok": tuple(payload["joint_names"])
@@ -175,12 +230,20 @@ def main() -> None:
     )
     parser.add_argument("--sample-index", type=int, action="append")
     parser.add_argument("--timeout-seconds", type=float, default=300)
+    parser.add_argument("--grad-cam-dir", type=Path, help="Enable Grad-CAM and save RGB/overlay/NPY files here")
+    parser.add_argument("--grad-cam-joint", type=int, choices=range(16), help="Explain one joint (zero-based); default: all joints")
+    parser.add_argument("--grad-cam-step", type=int, choices=range(64), help="Explain one action step (zero-based); default: all steps")
     args = parser.parse_args()
+    if args.grad_cam_dir is None and (args.grad_cam_joint is not None or args.grad_cam_step is not None):
+        parser.error("--grad-cam-joint/step require --grad-cam-dir")
     evaluate_hc_tj_inference_server(
         args.server_url,
         args.dataset_path,
         tuple(args.sample_index or (0, 300, 600)),
         args.timeout_seconds,
+        args.grad_cam_dir,
+        args.grad_cam_joint,
+        args.grad_cam_step,
     )
 
 
