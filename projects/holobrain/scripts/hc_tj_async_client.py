@@ -14,7 +14,7 @@
 # implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
-"""Run asynchronous HoloBrain inference against the HC-TJ ROS 2 robot."""
+"""Run HoloBrain's 16-value protocol against HC-TJ or HC OpenArmX."""
 
 from __future__ import annotations
 import argparse
@@ -96,8 +96,8 @@ _RESET_POSITION_TOLERANCE_RAD = 0.02
 class HcTjAsyncClientConfig:
     """Configure legacy direct ROS or HC's existing public Motion interface.
 
-    ``hc_motion`` uses a generated Robot API mapping and the existing DAgger
-    AUTO permission; it never resets the body or enables hardware itself.
+    ``hc_motion`` supports generated X1 and OpenArmX Robot API mappings and
+    existing DAgger AUTO permission. It does not reset or enable hardware.
     """
 
     server_url: str
@@ -180,14 +180,20 @@ class HcTjAsyncClientConfig:
 class ObservationBuffer:
     """Cache bounded ROS observations and synchronize on RGB time."""
 
-    def __init__(self, capacity: int = 120, joint_count: int = 17) -> None:
+    def __init__(
+        self,
+        capacity: int = 120,
+        joint_count: int = 17,
+        camera_base_frame: str = "zhi_Link",
+    ) -> None:
         self._lock = threading.Lock()
         self._joint_count = joint_count
+        self._camera_base_frame = camera_base_frame
         self._colors: deque[TimedValue] = deque(maxlen=capacity)
         self._depths: deque[TimedValue] = deque(maxlen=capacity)
         self._joints: deque[TimedValue] = deque(maxlen=capacity)
         self._intrinsic_mat: np.ndarray | None = None
-        self._zhi_to_eye_mat: np.ndarray | None = None
+        self._base_to_eye_mat: np.ndarray | None = None
 
     def add_color(self, timestamp_ns: int, data: bytes) -> None:
         """Cache one JPEG payload under its message timestamp."""
@@ -204,7 +210,7 @@ class ObservationBuffer:
             )
 
     def add_joints(self, timestamp_ns: int, positions: np.ndarray) -> None:
-        """Cache one ordered feedback sample (17 legacy axes or 14 HC arms)."""
+        """Cache ordered joints, with measured closures after OpenArmX arms."""
         values = np.asarray(positions, dtype=np.float64)
         if values.shape != (self._joint_count,) or not np.all(
             np.isfinite(values)
@@ -224,10 +230,12 @@ class ObservationBuffer:
             self._intrinsic_mat = value
 
     def set_extrinsics(self, payload: str) -> None:
-        """Validate and atomically replace the static zhi-to-eye transform."""
-        value = parse_robot_camera_extrinsics(payload)
+        """Replace the base-to-camera transform for the configured robot."""
+        value = parse_robot_camera_extrinsics(
+            payload, base_frame=self._camera_base_frame
+        )
         with self._lock:
-            self._zhi_to_eye_mat = value
+            self._base_to_eye_mat = value
 
     def synchronized(
         self,
@@ -237,7 +245,7 @@ class ObservationBuffer:
             if (
                 not self._colors
                 or self._intrinsic_mat is None
-                or self._zhi_to_eye_mat is None
+                or self._base_to_eye_mat is None
             ):
                 raise ValueError(
                     "color, calibration, or extrinsics are unavailable"
@@ -254,7 +262,7 @@ class ObservationBuffer:
                 depth,
                 joints,
                 self._intrinsic_mat.copy(),
-                self._zhi_to_eye_mat.copy(),
+                self._base_to_eye_mat.copy(),
             )
 
     def latest_joints(self) -> TimedValue:
@@ -276,7 +284,13 @@ class _InferenceRequestConfig(Protocol):
 
 
 class _HcRobotApi:
-    """Translate only the two arms using HC's existing generated SI mapping."""
+    """Map the 16 wire slots to X1 arms or OpenArmX arms and grippers.
+
+    Arm slots are right 1..7 then left 1..7. OpenArmX feedback appends measured
+    right/left closure after these 14 values; its gripper targets use public
+    prismatic joint names and metres. All limits and SI conversions come from
+    the generated file, whose identity must match the online HC instance.
+    """
 
     def __init__(self, path: Path) -> None:
         import yaml
@@ -293,12 +307,22 @@ class _HcRobotApi:
         self.validate_info(self.info)
         entries = resolved["joints"]
         by_model = {entry["model_name"]: entry for entry in entries}
+        openarmx = self.identity["profile_id"] == "openarmx"
+        self.model_names = (
+            tuple(
+                f"openarmx_{side}_joint{i}"
+                for side in ("right", "left")
+                for i in range(1, 8)
+            )
+            if openarmx
+            else ARM_JOINT_NAMES
+        )
         if (
             len(by_model) != len(entries)
-            or not set(ARM_JOINT_NAMES) <= by_model.keys()
+            or not set(self.model_names) <= by_model.keys()
         ):
-            raise ValueError("HC-TJ requires both complete seven-axis arms")
-        arms = [by_model[name] for name in ARM_JOINT_NAMES]
+            raise ValueError("HC requires both complete seven-axis arms")
+        arms = [by_model[name] for name in self.model_names]
         self.names = [entry["public_name"] for entry in arms]
         self.scale, self.offset, self.lower, self.upper = (
             np.asarray([entry[key] for entry in arms], dtype=float)
@@ -329,6 +353,43 @@ class _HcRobotApi:
             if not endpoint.startswith("/control/motion/"):
                 raise ValueError("HC public ServoJ endpoint is missing")
             self.groups[side] = (endpoint, list(group["joint_names"]))
+        self.grippers = []
+        self.camera_base_frame = "zhi_Link"
+        if openarmx:
+            self.camera_base_frame = self.info["groups"]["right_arm"][
+                "base_frame"
+            ]
+            if (
+                not self.camera_base_frame
+                or self.camera_base_frame
+                != (self.info["groups"]["left_arm"]["base_frame"])
+            ):
+                raise ValueError("OpenArmX arms require a common camera base")
+            for side in ("right", "left"):
+                entry = by_model.get(f"openarmx_{side}_finger_joint1")
+                if (
+                    not entry
+                    or entry["unit"] != "m"
+                    or not all(
+                        math.isfinite(entry[k])
+                        for k in (
+                            "scale",
+                            "offset",
+                            "model_lower",
+                            "model_upper",
+                        )
+                    )
+                    or entry["scale"] == 0
+                    or not 0 <= entry["model_lower"] < entry["model_upper"]
+                    or entry["public_name"] in self.names
+                ):
+                    raise ValueError("invalid OpenArmX gripper mapping")
+                self.grippers.append(entry)
+            if (
+                self.grippers[0]["public_name"]
+                == self.grippers[1]["public_name"]
+            ):
+                raise ValueError("OpenArmX gripper names must be distinct")
 
     def validate_info(self, info: dict[str, Any]) -> None:
         if any(info.get(key) != value for key, value in self.identity.items()):
@@ -339,6 +400,7 @@ class _HcRobotApi:
             )
 
     def feedback(self, names: list[str], positions: list[float]) -> np.ndarray:
+        """Return arm angles and, for OpenArmX, measured closures."""
         if len(names) != len(positions) or len(set(names)) != len(names):
             raise ValueError("invalid named HC joint feedback")
         values = dict(zip(names, positions, strict=True))
@@ -349,7 +411,34 @@ class _HcRobotApi:
         )
         if not np.isfinite(result).all():
             raise ValueError("nonfinite HC arm feedback")
+        for entry in self.grippers:
+            if entry["public_name"] not in values:
+                raise ValueError("HC joint feedback is missing a gripper")
+            measured = (
+                entry["scale"] * values[entry["public_name"]] + entry["offset"]
+            )
+            if not math.isfinite(measured):
+                raise ValueError("nonfinite HC gripper feedback")
+            closure = (entry["model_upper"] - measured) / (
+                entry["model_upper"] - entry["model_lower"]
+            )
+            result = np.append(result, np.clip(closure, 0.0, 1.0))
         return result
+
+    def gripper_targets(
+        self, closures: tuple[float, float]
+    ) -> tuple[list[str], list[float]]:
+        """Map right/left closure (0 open, 1 closed) to metre targets."""
+        names, positions = [], []
+        for entry, closure in zip(self.grippers, closures, strict=True):
+            if not math.isfinite(closure):
+                raise ValueError("nonfinite OpenArmX gripper command")
+            model = entry["model_upper"] + float(
+                np.clip(closure, 0.0, 1.0)
+            ) * (entry["model_lower"] - entry["model_upper"])
+            names.append(entry["public_name"])
+            positions.append((model - entry["offset"]) / entry["scale"])
+        return names, positions
 
     def targets(
         self, arm: np.ndarray
@@ -531,7 +620,12 @@ def _ros_node_class():
                 else None
             )
             self.observations = ObservationBuffer(
-                joint_count=14 if self._hc_api else 17
+                joint_count=(16 if self._hc_api.grippers else 14)
+                if self._hc_api
+                else 17,
+                camera_base_frame=self._hc_api.camera_base_frame
+                if self._hc_api
+                else "zhi_Link",
             )
             lower, upper = (
                 (self._hc_api.lower, self._hc_api.upper)
@@ -633,6 +727,7 @@ def _ros_node_class():
             self._arm_publishers = {}
             self._right_hand_publisher = None
             self._left_hand_publisher = None
+            self._gripper_publisher = None
             if config.enable_control:
                 if self._hc_api:
                     self._arm_publishers = {
@@ -645,16 +740,25 @@ def _ros_node_class():
                     self._joint_publisher = self.create_publisher(
                         JointState, config.joint_command_topic, latest_reliable
                     )
-                self._right_hand_publisher = self.create_publisher(
-                    JointState,
-                    config.right_hand_topic,
-                    latest_reliable if self._hc_api else latest_best_effort,
-                )
-                self._left_hand_publisher = self.create_publisher(
-                    JointState,
-                    config.left_hand_topic,
-                    latest_reliable if self._hc_api else latest_best_effort,
-                )
+                if self._hc_api and self._hc_api.grippers:
+                    self._gripper_publisher = self.create_publisher(
+                        JointState, "/internal/control/joint_targets", 10
+                    )
+                else:
+                    self._right_hand_publisher = self.create_publisher(
+                        JointState,
+                        config.right_hand_topic,
+                        latest_reliable
+                        if self._hc_api
+                        else latest_best_effort,
+                    )
+                    self._left_hand_publisher = self.create_publisher(
+                        JointState,
+                        config.left_hand_topic,
+                        latest_reliable
+                        if self._hc_api
+                        else latest_best_effort,
+                    )
             else:
                 self.get_logger().warning(
                     "dry-run active: no control publishers were created"
@@ -890,6 +994,8 @@ def _ros_node_class():
                 latency = self._latency_ewma or 0.0
                 right_hand = self._right_hand_observation
                 left_hand = self._left_hand_observation
+                if self._hc_api and self._hc_api.grippers:
+                    right_hand, left_hand = snapshot[2].value[14:16]
             delay = int(math.ceil(latency * ACTION_HZ))
             if remaining is not None:
                 delay = min(delay, len(remaining))
@@ -1027,6 +1133,35 @@ def _ros_node_class():
                         self.get_logger().info(
                             "default HC-TJ posture reached; inference enabled"
                         )
+                    return
+
+                if self._gripper_publisher is not None:
+                    names, positions = self._hc_api.gripper_targets(
+                        (float(action[7]), float(action[15]))
+                    )
+                    # Existing HC internal authority protocol. Both grippers
+                    # share one message and the current chunk's generation;
+                    # queued old messages cannot gain a later AUTO token.
+                    owner = self._owner
+                    if (
+                        owner.get("phase") != "grant"
+                        or owner["source"] != "motion"
+                    ):
+                        return
+                    key = ":".join(
+                        (
+                            "hc1",
+                            owner["controller_instance_id"],
+                            owner["session_id"],
+                            str(owner["epoch"]),
+                            "motion",
+                            owner["intervention_id"],
+                        )
+                    )
+                    message = JointState(name=names, position=positions)
+                    message.header.stamp = stamp
+                    message.header.frame_id = key + "#"
+                    self._gripper_publisher.publish(message)
                     return
 
                 for side, closure, publisher in (

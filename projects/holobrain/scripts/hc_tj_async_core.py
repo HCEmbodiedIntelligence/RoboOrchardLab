@@ -573,28 +573,30 @@ def parse_camera_calibration(payload: str | dict[str, Any]) -> np.ndarray:
 
 def parse_robot_camera_extrinsics(
     payload: str | dict[str, Any],
+    *,
+    base_frame: str = "zhi_Link",
 ) -> np.ndarray:
-    """Parse the static camera pose into ``zhi_Link -> eye``.
+    """Parse the camera pose into ``base_frame -> eye``.
 
     The JSON transform describes the model camera frame ``eye`` relative to
-    ``zhi_Link`` (stored as ``eye -> zhi_Link``), so this function returns its
-    inverse for the model's historical world-to-camera input.
+    the declared base, so this returns its inverse for the world-to-camera
+    input. The default preserves HC-TJ; HC OpenArmX supplies its profile base.
     """
     data = json.loads(payload) if isinstance(payload, str) else payload
     try:
         if data["schema"] != "hc_robot_camera_extrinsics/v1":
             raise ValueError("unsupported schema")
-        if data["common_frame"] != "zhi_Link":
-            raise ValueError("common_frame must be 'zhi_Link'")
+        if data["common_frame"] != base_frame:
+            raise ValueError(f"common_frame must be {base_frame!r}")
         matches = [
             item
             for item in data["transforms"]
-            if item.get("parent_frame") == "zhi_Link"
+            if item.get("parent_frame") == base_frame
             and item.get("child_frame") == "camera_head"
         ]
         if len(matches) != 1:
             raise ValueError(
-                "exactly one zhi_Link -> camera_head entry is required"
+                f"exactly one {base_frame} -> camera_head entry is required"
             )
         translation = np.asarray(matches[0]["translation_m"], dtype=np.float64)
         quat_xyzw = np.asarray(matches[0]["rotation_xyzw"], dtype=np.float64)
@@ -631,7 +633,7 @@ def parse_robot_camera_extrinsics(
             ],
         ]
     )
-    eye_to_zhi_mat = np.eye(4, dtype=np.float64)
-    eye_to_zhi_mat[:3, :3] = rotation
-    eye_to_zhi_mat[:3, 3] = translation
-    return np.linalg.inv(eye_to_zhi_mat)
+    eye_to_base_mat = np.eye(4, dtype=np.float64)
+    eye_to_base_mat[:3, :3] = rotation
+    eye_to_base_mat[:3, 3] = translation
+    return np.linalg.inv(eye_to_base_mat)

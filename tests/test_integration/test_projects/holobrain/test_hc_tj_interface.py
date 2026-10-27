@@ -17,6 +17,7 @@
 """Client/server transport and unmodified HC Motion integration checks."""
 
 from __future__ import annotations
+import copy
 import importlib.util
 import json
 import logging
@@ -43,6 +44,7 @@ from projects.holobrain.scripts.hc_tj_async_core import (
     ARM_JOINT_NAMES,
     HC_TJ_JOINT_NAMES,
     hand_command,
+    parse_robot_camera_extrinsics,
 )
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -228,6 +230,67 @@ def test_public_mapping_handles_order_scale_offset_and_extra_body(
     assert config.left_hand_topic == "/action/left_hand/joint_states"
 
 
+def test_openarmx_mapping_uses_measured_grippers_and_profile_camera_base(
+    hc_mapping_file,
+):
+    document = yaml.safe_load(hc_mapping_file.read_text())
+    document["profile_id"] = document["info"]["profile_id"] = "openarmx"
+    for index, entry in enumerate(document["joints"]):
+        side = "right" if index < 7 else "left"
+        entry["model_name"] = f"openarmx_{side}_joint{index % 7 + 1}"
+    for side in ("right", "left"):
+        document["info"]["groups"][side + "_arm"]["base_frame"] = (
+            "openarmx_body_link0"
+        )
+        document["joints"].append(
+            dict(
+                model_name=f"openarmx_{side}_finger_joint1",
+                public_name=f"{side}_gripper_joint_1",
+                unit="m",
+                scale=-2.0,
+                offset=0.044,
+                model_lower=0.0,
+                model_upper=0.044,
+            )
+        )
+    hc_mapping_file.write_text(yaml.safe_dump(document))
+    api = _HcRobotApi(hc_mapping_file)
+    names = [*api.names, "right_gripper_joint_1", "left_gripper_joint_1"]
+    values = [0.2] * 14 + [0.0055, 0.0165]
+    measured = api.feedback(list(reversed(names)), list(reversed(values)))
+    np.testing.assert_allclose(measured[:14], [-0.3] * 14)
+    np.testing.assert_allclose(measured[14:], [0.25, 0.75])
+    targets, positions = api.gripper_targets((0.0, 1.0))
+    assert targets == names[-2:]
+    np.testing.assert_allclose(positions, [0.0, 0.022])
+    with pytest.raises(ValueError, match="missing a gripper"):
+        api.feedback(names[:-1], values[:-1])
+    with pytest.raises(ValueError, match="nonfinite"):
+        api.gripper_targets((float("nan"), 0.0))
+    camera = dict(
+        schema="hc_robot_camera_extrinsics/v1",
+        common_frame="openarmx_body_link0",
+        transforms=[
+            dict(
+                parent_frame="openarmx_body_link0",
+                child_frame="camera_head",
+                translation_m=[0.1, 0.2, 0.3],
+                rotation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            )
+        ],
+    )
+    transform = parse_robot_camera_extrinsics(
+        camera, base_frame=api.camera_base_frame
+    )
+    np.testing.assert_allclose(transform[:3, 3], [-0.1, -0.2, -0.3])
+    with pytest.raises(ValueError, match="common_frame"):
+        parse_robot_camera_extrinsics(camera)
+    document["joints"][-1]["unit"] = "rad"
+    hc_mapping_file.write_text(yaml.safe_dump(document))
+    with pytest.raises(ValueError, match="gripper mapping"):
+        _HcRobotApi(hc_mapping_file)
+
+
 @pytest.mark.parametrize("source_clock_offset_s", [-3600, 3600])
 def test_auto_requires_new_receipts_independent_of_source_clock(
     tmp_path,
@@ -352,8 +415,9 @@ def test_auto_requires_new_receipts_independent_of_source_clock(
         worker.join(3)
 
 
+@pytest.mark.parametrize("profile_name", ["x1", "openarmx"])
 def test_client_through_existing_hc_motion_and_fake_robot(
-    tmp_path, monkeypatch, server_module
+    tmp_path, monkeypatch, server_module, profile_name
 ):
     """Run HTTP/DDS/HC/Motion/driver with fake cameras, model and plant."""
     baseline = os.environ.get("HC_INTERFACE_TEST_HC_ROOT")
@@ -370,6 +434,25 @@ def test_client_through_existing_hc_motion_and_fake_robot(
     from werkzeug.serving import make_server
 
     baseline = Path(baseline)
+    openarmx = profile_name == "openarmx"
+    adapter_source = None
+    if openarmx:
+        adapter_root = os.environ.get("HC_INTERFACE_TEST_OPENARMX_ROOT")
+        if not adapter_root:
+            pytest.skip(
+                "set HC_INTERFACE_TEST_OPENARMX_ROOT to the source checkout"
+            )
+        import openarmx_hc_robot_adapter.node as adapter
+
+        adapter_source = Path(adapter.__file__).resolve()
+        assert (
+            adapter_source
+            == (
+                Path(adapter_root)
+                / "src/openarmx_hc_robot_adapter"
+                / "openarmx_hc_robot_adapter/node.py"
+            ).resolve()
+        )
     monkeypatch.syspath_prepend(str(baseline))
     spec = importlib.util.spec_from_file_location(
         "hc_interface_rig", baseline / "tests/robot_api_fake_rig.py"
@@ -383,7 +466,9 @@ def test_client_through_existing_hc_motion_and_fake_robot(
     node = None
     try:
         with module.FakeRig(
-            baseline / "adapters/robots/x1", tmp_path / "rig"
+            baseline / "adapters/robots" / profile_name,
+            tmp_path / "rig",
+            with_teleop=openarmx,
         ) as rig:
             config = HcTjAsyncClientConfig(
                 server_url=f"http://127.0.0.1:{http.server_port}/holobrain/hc_tj_async/v1",
@@ -420,6 +505,49 @@ def test_client_through_existing_hc_motion_and_fake_robot(
             )
             observed = {side: [] for side in ("right", "left")}
             candidates = []
+            gripper_candidates = []
+            if openarmx:
+                gripper_names = {
+                    entry["public_name"] for entry in node._hc_api.grippers
+                }
+                rig.node.create_subscription(
+                    JointState,
+                    "/internal/control/joint_targets",
+                    lambda msg: gripper_candidates.append(msg)
+                    if set(msg.name) == gripper_names
+                    and ":motion:" in msg.header.frame_id
+                    else None,
+                    10,
+                )
+            vr = (
+                rig.node.create_publisher(String, "/vrdata", 1)
+                if openarmx
+                else None
+            )
+            vr_frame = dict(
+                protocol_version=3,
+                sequence=0,
+                vr_timestamp=0.0,
+                tracking=dict(head=True, left=True, right=True),
+                poses={
+                    "head": dict(
+                        position=[0.0, 1.5, 0.0],
+                        quaternion=[0.0, 0.0, 0.0, 1.0],
+                    ),
+                    "left": dict(
+                        position=[-0.2, 1.3, -0.4],
+                        quaternion=[0.0, 0.0, 0.0, 1.0],
+                    ),
+                    "right": dict(
+                        position=[0.2, 1.3, -0.4],
+                        quaternion=[0.0, 0.0, 0.0, 1.0],
+                    ),
+                },
+                inputs=dict(
+                    left=dict(grip=0.0, trigger=0.5),
+                    right=dict(grip=0.0, trigger=0.5),
+                ),
+            )
             for side, topic in (
                 ("right", config.right_hand_topic),
                 ("left", config.left_hand_topic),
@@ -486,9 +614,8 @@ def test_client_through_existing_hc_motion_and_fake_robot(
                 )
             )
             initial = dict(rig.positions)
-            target = np.asarray(
-                [initial[n] if n in initial else 0 for n in HC_TJ_JOINT_NAMES]
-            )
+            arm_initial = [initial[n] for n in node._hc_api.model_names]
+            target = np.asarray([*arm_initial[:7], 0.0, *arm_initial[7:], 0.0])
             target[3] += 0.015
             target[11] += 0.015
             target[7], target[15] = 0.2, 0.8
@@ -498,20 +625,29 @@ def test_client_through_existing_hc_motion_and_fake_robot(
                 nonlocal sequence
                 sequence += 1
                 now = rig.node.get_clock().now()
-                clutch.publish(
-                    String(
-                        data=json.dumps(
-                            dict(
-                                device_instance=peer,
-                                sequence=sequence,
-                                stamp_ns=now.nanoseconds,
-                                valid=True,
-                                gripped=gripped,
+                if openarmx:
+                    vr_frame.update(
+                        sequence=sequence,
+                        vr_timestamp=time.monotonic(),
+                        hc_received_ns=time.time_ns(),
+                    )
+                    vr_frame["inputs"]["right"]["grip"] = float(gripped)
+                    vr.publish(String(data=json.dumps(vr_frame)))
+                else:
+                    clutch.publish(
+                        String(
+                            data=json.dumps(
+                                dict(
+                                    device_instance=peer,
+                                    sequence=sequence,
+                                    stamp_ns=now.nanoseconds,
+                                    valid=True,
+                                    gripped=gripped,
+                                )
                             )
                         )
                     )
-                )
-                acknowledge()
+                    acknowledge()
                 for publisher, data, fmt in (
                     (color, jpeg, "jpeg"),
                     (depth, png, "png"),
@@ -524,10 +660,10 @@ def test_client_through_existing_hc_motion_and_fake_robot(
                         data=json.dumps(
                             dict(
                                 schema="hc_robot_camera_extrinsics/v1",
-                                common_frame="zhi_Link",
+                                common_frame=node._hc_api.camera_base_frame,
                                 transforms=[
                                     dict(
-                                        parent_frame="zhi_Link",
+                                        parent_frame=node._hc_api.camera_base_frame,
                                         child_frame="camera_head",
                                         translation_m=[0.0, 0.0, 0.0],
                                         rotation_xyzw=[0.0, 0.0, 0.0, 1.0],
@@ -551,13 +687,32 @@ def test_client_through_existing_hc_motion_and_fake_robot(
             rig.until(
                 lambda: all(
                     rig.positions[n] > initial[n] + 0.002
-                    for n in ("Joint4_R", "Joint4_L")
+                    for n in (
+                        node._hc_api.model_names[3],
+                        node._hc_api.model_names[10],
+                    )
                 ),
                 8,
             )
             assert all(observed.values()) and node.fault is None
             for side, value in (("right", 0.2), ("left", 0.8)):
-                names, positions = hand_command(side, value)
+                if openarmx:
+                    names = [f"openarmx_{side}_finger_joint1"]
+                    positions = [0.044 * (1 - value)]
+                    rig.until(
+                        lambda n=names[0], p=positions[0]: abs(
+                            rig.positions[n] - p
+                        )
+                        < 0.0005
+                    )
+                    assert any(
+                        topic
+                        == f"/{side}_forward_position_controller/commands"
+                        and abs(values[-1] - positions[0]) < 0.0005
+                        for topic, values in rig.controller_commands
+                    )
+                else:
+                    names, positions = hand_command(side, value)
                 assert observed[side][-1].name == list(names)
                 np.testing.assert_allclose(
                     observed[side][-1].position, positions
@@ -568,6 +723,22 @@ def test_client_through_existing_hc_motion_and_fake_robot(
                 for msg in candidates
             )
             assert backend.inputs[-1].history_joint_state[0].shape == (16,)
+            if openarmx:
+                np.testing.assert_allclose(
+                    backend.inputs[0].history_joint_state[0][[7, 15]],
+                    [
+                        1 - initial[f"openarmx_{side}_finger_joint1"] / 0.044
+                        for side in ("right", "left")
+                    ],
+                )
+                stale_grippers = copy.deepcopy(gripper_candidates[-1])
+                delayed = rig.node.create_publisher(
+                    JointState, "/internal/control/joint_targets", 10
+                )
+                auto_grippers = {
+                    s: rig.positions[f"openarmx_{s}_finger_joint1"]
+                    for s in ("right", "left")
+                }
 
             backend.delay_next = True
             rig.until(backend.entered.is_set, 4)
@@ -576,18 +747,114 @@ def test_client_through_existing_hc_motion_and_fake_robot(
             rig.pump(0.1)
             counts = (
                 len(candidates),
-                *(len(observed[s]) for s in ("right", "left")),
+                len(gripper_candidates)
+                if openarmx
+                else len(observed["right"]),
+                0 if openarmx else len(observed["left"]),
             )
             rig.pump(0.15)
             assert counts == (
                 len(candidates),
-                *(len(observed[s]) for s in ("right", "left")),
+                len(gripper_candidates)
+                if openarmx
+                else len(observed["right"]),
+                0 if openarmx else len(observed["left"]),
+            )
+            if openarmx:
+                manual_before = {
+                    s: rig.positions[f"openarmx_{s}_finger_joint1"]
+                    for s in ("right", "left")
+                }
+                vr_frame["inputs"]["right"]["trigger"] = 0.1
+                vr_frame["inputs"]["left"]["trigger"] = 0.9
+                rig.until(
+                    lambda: all(
+                        abs(
+                            rig.positions[f"openarmx_{s}_finger_joint1"]
+                            - manual_before[s]
+                        )
+                        > 0.003
+                        for s in ("right", "left")
+                    )
+                )
+                manual_after = {
+                    s: rig.positions[f"openarmx_{s}_finger_joint1"]
+                    for s in ("right", "left")
+                }
+                stale_grippers.header.stamp = (
+                    rig.node.get_clock().now().to_msg()
+                )
+                delayed.publish(stale_grippers)
+                rig.pump(0.1)
+                assert not any(
+                    msg.header.stamp == stale_grippers.header.stamp
+                    for messages in observed.values()
+                    for msg in messages
+                )
+            requests_before_release = len(backend.inputs)
+            measured_before_release = (
+                [
+                    1 - rig.positions[f"openarmx_{side}_finger_joint1"] / 0.044
+                    for side in ("right", "left")
+                ]
+                if openarmx
+                else None
             )
             gripped = False
             rig.until(lambda: node._owner.get("state") == "AUTO", 4)
             backend.release.set()
             rig.until(lambda: len(candidates) > counts[0], 5)
             assert node.fault is None
+            if openarmx:
+                np.testing.assert_allclose(
+                    backend.inputs[
+                        requests_before_release
+                    ].history_joint_state[0][[7, 15]],
+                    measured_before_release,
+                    atol=0.03,
+                )
+                rig.until(
+                    lambda: all(
+                        abs(
+                            rig.positions[f"openarmx_{s}_finger_joint1"] - goal
+                        )
+                        < 0.0005
+                        for s, goal in (("right", 0.0352), ("left", 0.0088))
+                    )
+                )
+                stale_grippers.header.stamp = (
+                    rig.node.get_clock().now().to_msg()
+                )
+                delayed.publish(stale_grippers)
+                rig.pump(0.1)
+                assert not any(
+                    msg.header.stamp == stale_grippers.header.stamp
+                    for messages in observed.values()
+                    for msg in messages
+                )
+                (tmp_path / "openarmx-evidence.json").write_text(
+                    json.dumps(
+                        dict(
+                            adapter_source=str(adapter_source),
+                            ros_domain=rig.domain,
+                            model="deterministic test backend",
+                            hardware="fake plant",
+                            auto_grippers_m=auto_grippers,
+                            manual_before_m=manual_before,
+                            manual_after_m=manual_after,
+                            resumed_grippers_m={
+                                s: rig.positions[f"openarmx_{s}_finger_joint1"]
+                                for s in ("right", "left")
+                            },
+                            manual_program_output_stopped=True,
+                            old_tokens_rejected_in_manual_and_auto=True,
+                            http_requests=len(backend.inputs),
+                            real_vr_adapter=True,
+                        ),
+                        indent=2,
+                    )
+                    + "\n"
+                )
             control.hold()
             rig.until(lambda: node._owner.get("state") == "HOLD")
             rig.executor.remove_node(node)
