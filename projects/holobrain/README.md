@@ -38,7 +38,6 @@ Get up and running with HoloBrain using RoboTwin2.0 simulation data. This walkth
 > This Quick Start uses simulation data. If you're working with physical hardware, check out these guides instead:
 > * **[Real Robot Pipeline Guide](REALBOT_PIPELINE_GUIDE.md)** — from data recording and packaging all the way through to model training.
 > * **[Real Robot Deployment Guide](REALBOT_DEPLOY_GUIDE.md)** — hardware setup, camera calibration, and running inference on the real robot.
-> * **[HC Motion Client](doc/hc_motion_client.md)** — connect the HC-TJ inference client to HC's existing public ROS interfaces.
 >
 > **Looking for other benchmarks?** HoloBrain also supports other simulation benchmarks:
 > * **[Using GenieSim 3.0 Benchmark](benchmarks/geniesim3.md)** — Instructions for packaging GenieSim 3.0 data and running benchmark evaluations with the HoloBrain policy through a GenieSim3-compatible model server.
