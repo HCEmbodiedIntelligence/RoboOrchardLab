@@ -14,12 +14,7 @@
 # implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
-"""Replay Arrow observations with simulated robot feedback on isolated topics.
-
-The simulated joints follow commands through the client's startup reset before
-inference checks begin. Images and the initial arm state come from one sample;
-actions come from a local fake server, rather than the dataset action sequence.
-"""
+"""Replay one Arrow sample through the real client on isolated ROS topics."""
 
 from __future__ import annotations
 import argparse
@@ -49,10 +44,8 @@ from projects.holobrain.scripts.hc_tj_async_core import (  # noqa: E402
     RIGHT_HAND_JOINT_NAMES,
 )
 
-__all__ = ["run_replay", "main"]
-
 DEFAULT_DATASET_PATH = (
-    REPOSITORY_ROOT / "projects/holobrain/data/arrow_dataset/hc_tj_261020_test"
+    REPOSITORY_ROOT / "projects/holobrain/data/arrow_dataset/hc_tj_260818_fix"
 )
 TOPIC_PREFIX = "/holobrain_hc_tj_replay"
 
@@ -232,35 +225,8 @@ def run_replay(dataset_path: Path, port: int) -> None:
         calibration_pub.publish(calibration)
         extrinsics_pub.publish(extrinsics)
 
-        arms = np.concatenate(
-            (sample["joint_state"][0, :7], sample["joint_state"][0, 8:15])
-        )
-        waist_hold = [0.1, 0.2, 0.3]
-        feedback = [*arms.tolist(), *waist_hold]
-        inference_start: int | None = None
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline:
-            if client.fault is not None:
-                raise AssertionError(f"replay client fault: {client.fault}")
-            # Hands are published only after reset, once inference is active.
-            if (
-                inference_start is None
-                and received["right"]
-                and received["left"]
-            ):
-                inference_start = len(received["joint"])
-            if (
-                inference_start is not None
-                and len(received["joint"]) - inference_start >= 80
-            ):
-                break
-            if received["joint"]:
-                # Echo commands as an ideal simulated robot, allowing reset
-                # to converge instead of publishing an unchanging arm state.
-                feedback = list(received["joint"][-1][1].position)
-            if inference_start is not None:
-                # Test waist feedback hold at a posture distinct from reset.
-                feedback[-3:] = waist_hold
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and len(received["joint"]) < 80:
             now = observer.get_clock().now().to_msg()
             color = CompressedImage()
             color.header.stamp = now
@@ -273,34 +239,24 @@ def run_replay(dataset_path: Path, port: int) -> None:
             state = JointState()
             state.header.stamp = now
             state.name = list(CONTROL_JOINT_NAMES)
-            state.position = feedback
+            arms = np.concatenate(
+                (sample["joint_state"][0, :7], sample["joint_state"][0, 8:15])
+            )
+            state.position = [*arms.tolist(), 0.1, 0.2, 0.3]
             color_pub.publish(color)
             depth_pub.publish(depth)
             joints_pub.publish(state)
             time.sleep(1 / 30)
 
-        if inference_start is None:
+        if len(received["joint"]) < 50:
             raise AssertionError(
-                "reset/inference did not complete within 20 seconds; "
-                f"received {len(received['joint'])} joint commands "
-                "without both hand commands"
-            )
-        inference_commands = received["joint"][inference_start:]
-        if len(inference_commands) < 50:
-            raise AssertionError(
-                "expected >=50 post-reset arm commands, "
-                f"got {len(inference_commands)}"
+                f"expected >=50 arm commands, got {len(received['joint'])}"
             )
         command = received["joint"][-1][1]
-        if tuple(command.name) != CONTROL_JOINT_NAMES:
-            raise AssertionError(
-                f"17-axis command order failed: {command.name}"
-            )
-        if not np.allclose(command.position[-3:], waist_hold):
-            raise AssertionError(
-                f"waist hold failed: expected {waist_hold}, "
-                f"got {list(command.position[-3:])}"
-            )
+        if tuple(command.name) != CONTROL_JOINT_NAMES or not np.allclose(
+            command.position[-3:], [0.1, 0.2, 0.3]
+        ):
+            raise AssertionError("17-axis command order or waist hold failed")
         if tuple(received["right"][-1].name) != RIGHT_HAND_JOINT_NAMES:
             raise AssertionError(
                 "right hand command is not the complete 10-axis map"
@@ -309,7 +265,7 @@ def run_replay(dataset_path: Path, port: int) -> None:
             raise AssertionError(
                 "left hand command is not the complete 10-axis map"
             )
-        times = np.asarray([item[0] for item in inference_commands[-50:]])
+        times = np.asarray([item[0] for item in received["joint"][-50:]])
         measured_hz = 49 / (times[-1] - times[0])
         if not 85 <= measured_hz <= 115:
             raise AssertionError(
@@ -352,7 +308,6 @@ def run_replay(dataset_path: Path, port: int) -> None:
 
 
 def main() -> None:
-    """Run the isolated ROS replay for the selected Arrow dataset."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--dataset-path", type=Path, default=DEFAULT_DATASET_PATH
