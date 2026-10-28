@@ -17,6 +17,7 @@
 from __future__ import annotations
 import json
 import struct
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -38,6 +39,9 @@ from projects.holobrain.scripts.convert_hc_tj_mcap import (
     MCAP_MAGIC,
     RIGHT_FINGER_COMMAND_TOPIC,
     _deserialize_message,
+    _load_source,
+    _October2026Adapter,
+    _parse_finger_sample,
     _readable_mcap_path,
     convert_hc_tj_mcap,
 )
@@ -92,7 +96,7 @@ def _extrinsics() -> dict:
     }
 
 
-def _write_synthetic_mcap(path: Path) -> Path:
+def _write_synthetic_mcap(path: Path, *, october: bool = False) -> Path:
     from rosbags.rosbag2 import StoragePlugin, Writer
     from rosbags.typesys import Stores, get_typestore
 
@@ -107,8 +111,22 @@ def _write_synthetic_mcap(path: Path) -> Path:
     depth = _encode_image(np.arange(24, dtype=np.uint16).reshape(4, 6), ".png")
 
     with Writer(path, version=9, storage_plugin=StoragePlugin.MCAP) as writer:
+        topic_map = {
+            COLOR_TOPIC: "/observation/cameras/head/color/compressed",
+            DEPTH_TOPIC: "/observation/cameras/head/depth/compressed",
+            JOINT_STATE_TOPIC: "/observation/joint_states",
+            JOINT_COMMAND_TOPIC: "/action/joint_states",
+            RIGHT_FINGER_COMMAND_TOPIC: "/action/right_hand/joint_states",
+            LEFT_FINGER_COMMAND_TOPIC: "/action/left_hand/joint_states",
+            CALIBRATION_TOPIC: "/observation/cameras/head/calibration",
+            EXTRINSICS_TOPIC: "/observation/cameras/head/extrinsics",
+        }
         connections = {
-            topic: writer.add_connection(topic, msgtype, typestore=typestore)
+            topic: writer.add_connection(
+                topic_map[topic] if october else topic,
+                msgtype,
+                typestore=typestore,
+            )
             for topic, msgtype in {
                 COLOR_TOPIC: "sensor_msgs/msg/CompressedImage",
                 DEPTH_TOPIC: "sensor_msgs/msg/CompressedImage",
@@ -122,11 +140,41 @@ def _write_synthetic_mcap(path: Path) -> Path:
         }
 
         def write(topic: str, message, timestamp_ns: int, zero_tail=False):
+            if october and topic == JOINT_COMMAND_TOPIC:
+                # Startup includes waist targets; later commands omit them.
+                size = 17 if timestamp_ns < 1_040_000_000 else 14
+                message = replace(
+                    message,
+                    name=message.name[:size]
+                    + ["head_1", "head_2", "R_ban", "L_ban"],
+                    position=np.concatenate(
+                        [message.position[:size], [9.0] * 4]
+                    ),
+                    velocity=np.array([], dtype=np.float64),
+                    effort=np.array([], dtype=np.float64),
+                )
+                # The adapter must select by name, not positional prefixes.
+                message = replace(
+                    message,
+                    name=message.name[::-1],
+                    position=message.position[::-1].copy(),
+                )
+            elif october and topic in (
+                RIGHT_FINGER_COMMAND_TOPIC,
+                LEFT_FINGER_COMMAND_TOPIC,
+            ):
+                prefix = message.name[0][0]
+                message = replace(
+                    message,
+                    name=[f"{prefix}_finger_{i}" for i in range(10)]
+                    + message.name,
+                    position=np.concatenate([[0.25] * 10, message.position]),
+                )
             raw = bytes(typestore.serialize_cdr(message, message.__msgtype__))
             writer.write(
                 connections[topic],
                 timestamp_ns,
-                raw + (bytes(8) if zero_tail else b""),
+                raw + (bytes(8) if zero_tail and not october else b""),
             )
 
         write(
@@ -269,8 +317,11 @@ def test_zero_tail_compatibility_is_exact() -> None:
         )
 
 
-def test_synthetic_mcap_converts_to_ro_dataset(tmp_path: Path) -> None:
-    mcap_path = _write_synthetic_mcap(tmp_path / "bag")
+@pytest.mark.parametrize("october", [False, True])
+def test_synthetic_mcap_converts_to_ro_dataset(
+    tmp_path: Path, october: bool
+) -> None:
+    mcap_path = _write_synthetic_mcap(tmp_path / "bag", october=october)
     output = tmp_path / "dataset"
     urdf = (
         Path(__file__).resolve().parents[4]
@@ -295,7 +346,7 @@ def test_synthetic_mcap_converts_to_ro_dataset(tmp_path: Path) -> None:
     assert len(report["episodes"]) == 1
     assert report["frames"]["candidate_rgb_frames"] == 2
     assert report["frames"]["output_frames"] == 2
-    assert report["joint_command_zero_tail_messages"] == 2
+    assert report["joint_command_zero_tail_messages"] == (0 if october else 2)
     assert report["finger_command_trimmed_tail_messages"] == 0
     assert mcap_path.read_bytes() == source_digest
     assert {
@@ -331,8 +382,25 @@ def test_synthetic_mcap_converts_to_ro_dataset(tmp_path: Path) -> None:
         replay_config[name] == value
         for name, value in TORSO_JOINT_CONFIG.items()
     )
-    assert report["messages"][RIGHT_FINGER_COMMAND_TOPIC] == 2
-    assert report["messages"][LEFT_FINGER_COMMAND_TOPIC] == 2
+    right_topic = (
+        "/action/right_hand/joint_states"
+        if october
+        else RIGHT_FINGER_COMMAND_TOPIC
+    )
+    left_topic = (
+        "/action/left_hand/joint_states"
+        if october
+        else LEFT_FINGER_COMMAND_TOPIC
+    )
+    assert report["messages"][right_topic] == 2
+    assert report["messages"][left_topic] == 2
+    np.testing.assert_allclose(
+        frame["actions"].position.numpy()[0, :7], np.arange(7) / 100
+    )
+    np.testing.assert_allclose(
+        dataset[1]["actions"].position.numpy()[0, 8:15],
+        np.arange(7, 14) / 100 + 1,
+    )
     assert (
         report["frames"]["nearest_neighbor_error_ms"]["right_finger_command"][
             "tolerance"
@@ -355,6 +423,74 @@ def test_synthetic_mcap_converts_to_ro_dataset(tmp_path: Path) -> None:
     assert decoded_depth.shape == (4, 6)
 
 
+def test_october_projection_validates_and_does_not_mutate() -> None:
+    from rosbags.typesys import Stores, get_typestore
+
+    joint_type = get_typestore(Stores.ROS2_HUMBLE).types[
+        "sensor_msgs/msg/JointState"
+    ]
+    message = joint_type(
+        header=None,
+        name=["unused", "R_ban"],
+        position=np.array([0.25, 1.0]),
+        velocity=np.array([]),
+        effort=np.array([]),
+    )
+    normalized = _October2026Adapter.normalize(
+        message, RIGHT_FINGER_COMMAND_TOPIC
+    )
+    assert normalized.name == ["R_ban"]
+    assert (
+        _parse_finger_sample(
+            normalized, 1, RIGHT_FINGER_COMMAND_TOPIC, "R_ban"
+        ).position
+        == 1.0
+    )
+    normalized.position[0] = 0
+    assert message.position.tolist() == [0.25, 1.0]
+    assert message.name == ["unused", "R_ban"]
+    for invalid in (
+        replace(message, name=["R_ban", "R_ban"]),
+        replace(message, name=["unused", "missing"]),
+        replace(message, position=np.array([1.0])),
+        replace(message, velocity=np.array([1.0])),
+    ):
+        with pytest.raises(ValueError, match="joint names|values"):
+            _October2026Adapter.normalize(invalid, RIGHT_FINGER_COMMAND_TOPIC)
+    for value in (0.5, np.nan):
+        invalid = replace(message, position=np.array([0.25, value]))
+        normalized = _October2026Adapter.normalize(
+            invalid, RIGHT_FINGER_COMMAND_TOPIC
+        )
+        with pytest.raises(ValueError, match="binary"):
+            _parse_finger_sample(
+                normalized, 1, RIGHT_FINGER_COMMAND_TOPIC, "R_ban"
+            )
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_incomplete_or_mixed_layout_rejected(
+    tmp_path: Path, mixed: bool
+) -> None:
+    from rosbags.rosbag2 import StoragePlugin, Writer
+    from rosbags.typesys import Stores, get_typestore
+
+    path = tmp_path / "bad"
+    store = get_typestore(Stores.ROS2_HUMBLE)
+    with Writer(path, version=9, storage_plugin=StoragePlugin.MCAP) as writer:
+        writer.add_connection(
+            "/observation/cameras/head/color/compressed",
+            "sensor_msgs/msg/CompressedImage",
+            typestore=store,
+        )
+        if mixed:
+            writer.add_connection(
+                COLOR_TOPIC, "sensor_msgs/msg/CompressedImage", typestore=store
+            )
+    with pytest.raises(ValueError, match="Mixed" if mixed else "missing"):
+        _load_source(path / "bad.mcap")
+
+
 def test_mcap_directory_converts_to_multi_episode_dataset(
     tmp_path: Path,
 ) -> None:
@@ -362,7 +498,7 @@ def test_mcap_directory_converts_to_multi_episode_dataset(
     nested = source_root / "nested"
     nested.mkdir(parents=True)
     first = _write_synthetic_mcap(source_root / "episode_b")
-    second = _write_synthetic_mcap(nested / "episode_a")
+    second = _write_synthetic_mcap(nested / "episode_a", october=True)
     output = tmp_path / "dataset"
     urdf = (
         Path(__file__).resolve().parents[4]

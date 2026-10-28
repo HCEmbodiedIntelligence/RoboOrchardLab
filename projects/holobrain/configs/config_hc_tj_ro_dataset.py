@@ -41,7 +41,7 @@ _DATASET_PATH = (
     Path(__file__).resolve().parents[1]
     / "data"
     / "arrow_dataset"
-    / "hc_tj_260902_test"
+    / "hc_tj_261026"
 )
 _ARM_ONLY_DATASET_PATH = (
     Path(__file__).resolve().parents[1] / "data" / "arrow_dataset" / "hc_tj"

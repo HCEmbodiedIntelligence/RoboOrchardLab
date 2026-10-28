@@ -26,7 +26,7 @@ import struct
 import tempfile
 from collections import Counter
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Generator, Iterator, Sequence
 
@@ -160,6 +160,69 @@ class _SynchronizedFrame:
     joint_command: _JointSample
     right_finger_command: _FingerSample
     left_finger_command: _FingerSample
+
+
+class _October2026Adapter:
+    """Adapt observation/action recordings to the original input contract.
+
+    All temporary layout knowledge lives here. To retire it, remove this
+    class and the adapter selection/normalization hooks in ``_load_source``.
+    Synchronization and dataset packaging do not depend on this layout.
+    """
+
+    COMMAND_JOINT_NAMES = ARM_JOINT_NAMES
+    TOPICS = {
+        COLOR_TOPIC: "/observation/cameras/head/color/compressed",
+        DEPTH_TOPIC: "/observation/cameras/head/depth/compressed",
+        JOINT_STATE_TOPIC: "/observation/joint_states",
+        JOINT_COMMAND_TOPIC: "/action/joint_states",
+        RIGHT_FINGER_COMMAND_TOPIC: "/action/right_hand/joint_states",
+        LEFT_FINGER_COMMAND_TOPIC: "/action/left_hand/joint_states",
+        CALIBRATION_TOPIC: "/observation/cameras/head/calibration",
+        EXTRINSICS_TOPIC: "/observation/cameras/head/extrinsics",
+    }
+
+    @staticmethod
+    def normalize(message: Any, topic: str) -> Any:
+        """Copy projected joints; leave other decoded messages untouched.
+
+        Reject duplicate/missing names and malformed arrays before dropping
+        unused joints. Existing parsers validate the projected values and
+        binary gripper semantics. The decoded input is never mutated.
+        """
+        if topic == JOINT_COMMAND_TOPIC:
+            # Waist targets disappear after startup in these recordings.
+            selected_names = _October2026Adapter.COMMAND_JOINT_NAMES
+        elif topic == RIGHT_FINGER_COMMAND_TOPIC:
+            selected_names = (RIGHT_FINGER_JOINT_NAME,)
+        elif topic == LEFT_FINGER_COMMAND_TOPIC:
+            selected_names = (LEFT_FINGER_JOINT_NAME,)
+        else:
+            return message
+
+        names = list(message.name)
+        if len(set(names)) != len(names) or not set(selected_names) <= set(
+            names
+        ):
+            raise ValueError(
+                f"{_October2026Adapter.TOPICS[topic]} "
+                "has duplicate or missing "
+                f"joint names; required {list(selected_names)}, got {names}"
+            )
+        indices = [names.index(name) for name in selected_names]
+        fields = {}
+        for field in ("position", "velocity", "effort"):
+            values = getattr(message, field)
+            if len(values) == 0 and field != "position":
+                fields[field] = values.copy()
+                continue
+            if len(values) != len(names):
+                raise ValueError(
+                    f"{_October2026Adapter.TOPICS[topic]} {field} has "
+                    f"{len(values)} values for {len(names)} joint names"
+                )
+            fields[field] = np.asarray(values)[indices].copy()
+        return replace(message, name=list(selected_names), **fields)
 
 
 def _normalize_msgtype(msgtype: str) -> str:
@@ -338,13 +401,23 @@ def _header_timestamp_ns(message: Any, log_time_ns: int) -> int:
 
 
 def _parse_joint_sample(
-    message: Any, timestamp_ns: int, topic: str
+    message: Any,
+    timestamp_ns: int,
+    topic: str,
+    *,
+    expected_names: tuple[str, ...] = EXPECTED_SOURCE_JOINT_NAMES,
 ) -> _JointSample:
+    """Validate the source order and select the leading 14 arm joints.
+
+    ``expected_names`` is the original 17-joint layout by default; an input
+    adapter may provide the arm-only order after validating and projecting
+    its source. Missing optional velocity/effort arrays become zeros.
+    """
     names = tuple(message.name)
-    if names != EXPECTED_SOURCE_JOINT_NAMES:
+    if names != expected_names:
         raise ValueError(
             f"{topic} joint order mismatch: expected "
-            f"{list(EXPECTED_SOURCE_JOINT_NAMES)}, got {list(names)}"
+            f"{list(expected_names)}, got {list(names)}"
         )
 
     def select(values: Sequence[float], field: str) -> np.ndarray:
@@ -580,16 +653,32 @@ def _load_source(read_path: Path) -> _ParsedSource:
     typestore = get_typestore(Stores.ROS2_HUMBLE)
 
     with AnyReader([read_path]) as reader:
+        source_topics = {connection.topic for connection in reader.connections}
+        adapter = None
+        topic_map = {topic: topic for topic in EXPECTED_TOPIC_TYPES}
+        if source_topics.intersection(_October2026Adapter.TOPICS.values()):
+            if source_topics.intersection(EXPECTED_TOPIC_TYPES):
+                raise ValueError(
+                    "Mixed hc_tj MCAP topic layouts are ambiguous"
+                )
+            adapter = _October2026Adapter()
+            topic_map = adapter.TOPICS
+        canonical_topics = {
+            actual: topic for topic, actual in topic_map.items()
+        }
         connections_by_topic: dict[str, list[Any]] = {
             topic: [] for topic in EXPECTED_TOPIC_TYPES
         }
         for connection in reader.connections:
-            if connection.topic in connections_by_topic:
-                connections_by_topic[connection.topic].append(connection)
+            topic = canonical_topics.get(connection.topic)
+            if topic is not None:
+                connections_by_topic[topic].append(connection)
         for topic, expected_type in EXPECTED_TOPIC_TYPES.items():
             connections = connections_by_topic[topic]
             if not connections:
-                raise ValueError(f"Required MCAP topic is missing: {topic}")
+                raise ValueError(
+                    f"Required MCAP topic is missing: {topic_map[topic]}"
+                )
             actual_types = {
                 _normalize_msgtype(connection.msgtype)
                 for connection in connections
@@ -608,17 +697,21 @@ def _load_source(read_path: Path) -> _ParsedSource:
         for connection, log_time_ns, raw in reader.messages(
             connections=selected_connections
         ):
-            topic = connection.topic
+            topic = canonical_topics[connection.topic]
             msgtype = EXPECTED_TOPIC_TYPES[topic]
             message, trimmed = _deserialize_message(
                 typestore,
                 raw,
                 msgtype,
-                allow_zero_tail=topic == JOINT_COMMAND_TOPIC,
-                allow_eight_byte_tail=topic
+                allow_zero_tail=adapter is None
+                and topic == JOINT_COMMAND_TOPIC,
+                allow_eight_byte_tail=adapter is None
+                and topic
                 in (RIGHT_FINGER_COMMAND_TOPIC, LEFT_FINGER_COMMAND_TOPIC),
             )
-            counts[topic] += 1
+            if adapter is not None:
+                message = adapter.normalize(message, topic)
+            counts[connection.topic] += 1
             if trimmed and topic == JOINT_COMMAND_TOPIC:
                 command_zero_tail_messages += 1
             elif trimmed:
@@ -637,7 +730,16 @@ def _load_source(read_path: Path) -> _ParsedSource:
                 )
             elif topic == JOINT_COMMAND_TOPIC:
                 joint_commands.append(
-                    _parse_joint_sample(message, timestamp_ns, topic)
+                    _parse_joint_sample(
+                        message,
+                        timestamp_ns,
+                        topic,
+                        expected_names=(
+                            adapter.COMMAND_JOINT_NAMES
+                            if adapter is not None
+                            else EXPECTED_SOURCE_JOINT_NAMES
+                        ),
+                    )
                 )
             elif topic == RIGHT_FINGER_COMMAND_TOPIC:
                 right_finger_commands.append(
@@ -1111,6 +1213,12 @@ def convert_hc_tj_mcap(
     The ``joints`` and ``actions`` columns use a 16-axis per-arm layout:
     ``Joint1_R..Joint7_R, R_ban, Joint1_L..Joint7_L, L_ban``. The two
     ``*_ban`` positions are synchronized binary end-effector states.
+    Original ``io_teleop`` and October 2026 ``observation/action`` layouts
+    are detected per file; mixing their recognized topics in one file is
+    rejected. The latter uses issued action joints and extracts ``*_ban``
+    from hand actions, ignoring extra head/hand joints. Reports retain the
+    original source topic names. Both layouts use the same synchronization
+    tolerances and camera calibration/extrinsics contract.
 
     Args:
         input_path: A source MCAP, a recursively searched directory, or a
