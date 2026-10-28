@@ -16,7 +16,8 @@ sphinx_markdown_tables
 sphinx-gallery>=0.18.0
 sphinx_rtd_theme
 sphinx_bootstrap_theme
-sphinx-autoapi
+# docs/doc_gen/autoapi_ext.py uses Mapper._OBJ_MAP, removed in 3.8.1.
+sphinx-autoapi==3.8.0
 recommonmark>=0.7.1
 furo>=2024.8.6
 sphinx-markdown-tables>=0.0.17
@@ -55,6 +56,7 @@ packaging>=25.0
 twine>=6.1.0
 requests-toolbelt>=1.0.0
 setuptools>=77.0.3,<80.0.0
+protobuf>=5.26.1,<6.0dev
 
 # numpy
 numpy<2

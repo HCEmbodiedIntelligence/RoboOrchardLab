@@ -21,12 +21,14 @@ import pickle
 import threading
 import time
 import weakref
+from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
 import pytest
 import torch
 from accelerate import Accelerator
+from accelerate.data_loader import prepare_data_loader
 from accelerate.utils import DataLoaderConfiguration
 from robo_orchard_core.utils.config import ClassType
 from torch.utils.data import (
@@ -40,6 +42,7 @@ from robo_orchard_lab.dataset.robot import (
     BatchLoaderConfig,
     DataLoader,
     DatasetItem,
+    DatasetItemGroup,
     DatasetWithIndices,
     IterableDatasetMixin,
     IterableWithLenDataset,
@@ -56,6 +59,8 @@ from robo_orchard_lab.dataset.robot._prefetch import (
 from robo_orchard_lab.dataset.robot.dataset_ex import (
     _DEFAULT_VIRTUAL_GETITEMS_BATCH_SIZE,
     DictIterableDataset,
+    _build_path_tree,
+    _format_path_tree,
 )
 from robo_orchard_lab.dataset.sampler import ShardStrategy
 from robo_orchard_lab.utils.accelerate import (
@@ -123,6 +128,16 @@ class ArrayDatasetItem(DatasetItem[ArrayDataset]):
 
     def _create_dataset(self) -> ArrayDataset:
         return ArrayDataset(self.data)
+
+
+class ArrayDatasetItemGroup(DatasetItemGroup):
+    """Test-only logical group backed by independent in-memory leaves."""
+
+    data_groups: list[list[int]]
+
+    def iter_dataset_items(self):
+        for data in self.data_groups:
+            yield ArrayDatasetItem(data=data)
 
 
 def _get_dataloader_multiprocessing_context(
@@ -380,7 +395,7 @@ class TestIterableWithLenDataset(TestIterableDatasetMixin):
             resample_ratio=2.0,
         )
         direct_items = list(
-            direct_dataset._torch_iter(direct_dataset.indice_sampler)
+            direct_dataset._iter_impl(direct_dataset.indice_sampler)
         )
 
         assert prefetch_items == direct_items
@@ -470,6 +485,139 @@ class TestIterableWithLenDataset(TestIterableDatasetMixin):
 
         assert len(batches) == 1
         assert sorted(batches[0].tolist()) == [0, 0, 1, 1]
+
+    @pytest.mark.parametrize("drop_last_batch", [False, True])
+    def test_explicit_batch_iteration(self, drop_last_batch):
+        dataset = IterableWithLenDataset(BatchedArrayDataset(list(range(10))))
+
+        batches = list(dataset.iter(4, drop_last_batch=drop_last_batch))
+
+        expected = [list(range(4)), list(range(4, 8))]
+        if not drop_last_batch:
+            expected.append([8, 9])
+        assert [batch.tolist() for batch in batches] == expected
+        assert dataset.batch_loader_kwargs is None
+
+    def test_explicit_batch_iteration_overrides_only_batch_policy(self):
+        def collate_fn(rows):
+            return {"rows": tuple(rows)}
+
+        config = BatchLoaderConfig(
+            batch_size=7, drop_last=True, collate_fn=collate_fn
+        )
+        dataset = IterableWithLenDataset(
+            ArrayDataset(list(range(10))), batch_loader_kwargs=config
+        )
+
+        assert list(dataset.iter(batch_size=4)) == [
+            {"rows": (0, 1, 2, 3)},
+            {"rows": (4, 5, 6, 7)},
+            {"rows": (8, 9)},
+        ]
+        assert dataset.batch_loader_kwargs is config
+        assert config.batch_size == 7
+        assert config.drop_last is True
+        assert config.collate_fn is collate_fn
+        assert list(dataset) == [{"rows": tuple(range(7))}]
+
+    @pytest.mark.parametrize("generator_kind", ["torch", "numpy"])
+    @pytest.mark.parametrize("resample_ratio", [0.5, 2.5])
+    @pytest.mark.parametrize("drop_last_batch", [False, True])
+    def test_explicit_batch_iteration_preserves_sampling(
+        self, generator_kind, resample_ratio, drop_last_batch
+    ):
+        def collect(explicit):
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(31)
+                generator = (
+                    torch.Generator().manual_seed(17)
+                    if generator_kind == "torch"
+                    else np.random.default_rng(17)
+                )
+                dataset = IterableWithLenDataset(
+                    ArrayDataset(list(range(10))),
+                    shuffle=ShuffleConfig(
+                        shuffle=True, chunk_size=3, prefetch_factor=3
+                    ),
+                    generator=generator,
+                    resample_ratio=resample_ratio,
+                    batch_loader_kwargs=BatchLoaderConfig(
+                        batch_size=7 if explicit else 4,
+                        drop_last=not drop_last_batch
+                        if explicit
+                        else drop_last_batch,
+                    ),
+                )
+                iterator = (
+                    dataset.iter(4, drop_last_batch)
+                    if explicit
+                    else iter(dataset)
+                )
+                batches = [batch.tolist() for batch in iterator]
+                state = (
+                    generator.get_state()
+                    if isinstance(generator, torch.Generator)
+                    else generator.bit_generator.state
+                )
+                return batches, state, torch.get_rng_state()
+
+        actual, actual_rng, actual_global_rng = collect(True)
+        expected, expected_rng, expected_global_rng = collect(False)
+
+        assert actual == expected
+        if generator_kind == "torch":
+            assert torch.equal(actual_rng, expected_rng)
+        else:
+            assert actual_rng == expected_rng
+        assert torch.equal(actual_global_rng, expected_global_rng)
+        rows = round(10 * resample_ratio)
+        if drop_last_batch:
+            rows -= rows % 4
+        assert sum(map(len, actual)) == rows
+
+    @pytest.mark.parametrize("worker_id", [0, 1])
+    @pytest.mark.parametrize("drop_last_batch", [False, True])
+    def test_explicit_batch_iteration_uses_worker_local_rows(
+        self, monkeypatch, worker_id, drop_last_batch
+    ):
+        worker = SimpleNamespace(num_workers=2, id=worker_id)
+        monkeypatch.setattr(
+            torch.utils.data, "get_worker_info", lambda: worker
+        )
+        dataset = IterableWithLenDataset(
+            ArrayDataset(list(range(10))),
+            shuffle=True,
+            generator=torch.Generator().manual_seed(17),
+            resample_ratio=2.5,
+        )
+
+        batches = list(dataset.iter(4, drop_last_batch))
+        rows = [value for batch in batches for value in batch.tolist()]
+
+        assert set(rows) == set(range(worker_id * 5, worker_id * 5 + 5))
+        assert len(rows) == (12 if drop_last_batch or worker_id == 1 else 13)
+
+    @pytest.mark.parametrize(
+        "batch_size,drop_last_batch,error",
+        [
+            (0, False, "batch_size"),
+            (-1, False, "batch_size"),
+            (True, False, "batch_size"),
+            (1.5, False, "batch_size"),
+            ("4", False, "batch_size"),
+            (None, False, "batch_size"),
+            (4, None, "drop_last_batch"),
+            (4, 1, "drop_last_batch"),
+            (4, "False", "drop_last_batch"),
+        ],
+    )
+    def test_explicit_batch_iteration_validates_arguments(
+        self, batch_size, drop_last_batch, error
+    ):
+        dataset = IterableWithLenDataset(ArrayDataset([0, 1]))
+
+        with pytest.raises(ValueError, match=error):
+            list(dataset.iter(batch_size, drop_last_batch))
 
     def test_resample_ratio_survives_views_and_dataloader_clone(
         self,
@@ -927,6 +1075,295 @@ class TestDictIterableDataset(TestIterableDatasetMixin):
 
         assert outputs[0] == outputs[1] == outputs[2]
 
+    def test_group_expands_to_its_physical_members(self) -> None:
+        group = ArrayDatasetItemGroup(
+            name="source/group",
+            data_groups=[[0, 1], [10, 11, 12]],
+        )
+        dataset = DictIterableDataset([group])
+
+        assert group.get_dataset_row_num() == 5
+        assert group.get_dataset_row_num() == 5
+        assert list(dataset) == [0, 1, 10, 11, 12]
+        assert len(dataset.dataset_items) == 2
+        assert dataset.logical_dataset_items == [group]
+        assert dataset.total_dataset_length == 5
+        assert dataset.total_iterator_length == 5
+
+    def test_group_reflects_config_changes(self) -> None:
+        group = ArrayDatasetItemGroup(data_groups=[[0, 1]])
+
+        assert group.get_dataset_row_num() == 2
+        group.data_groups[0].append(2)
+        assert group.get_dataset_row_num() == 3
+
+        copied = group.copy()
+        copied.data_groups = [[10, 11, 12, 13]]
+        assert copied.get_dataset_row_num() == 4
+        dataset = DictIterableDataset([copied])
+        assert dataset.total_iterator_length == 4
+        assert list(dataset) == [10, 11, 12, 13]
+
+    @pytest.mark.parametrize(
+        "shard_kwargs,expected",
+        [
+            (ShardConfig(contiguous=True), [2, 5, 6]),
+            (ShardConfig(contiguous=False), [1, 4, 6]),
+        ],
+    )
+    def test_group_propagates_static_sharding_per_member(
+        self,
+        shard_kwargs: ShardConfig,
+        expected: list[int],
+    ) -> None:
+        group = ArrayDatasetItemGroup(
+            data_groups=[[0, 1, 2], [3, 4, 5, 6]],
+        )
+        dataset = DictIterableDataset(
+            [group],
+            shard_kwargs=shard_kwargs,
+        ).shard(num_shards=2, index=1)
+
+        assert list(dataset) == expected
+        assert dataset.total_dataset_length == 7
+        assert dataset.total_iterator_length == len(expected)
+        assert group.shard(num_shards=2, index=1).get_sharded_row_num(
+            shard_kwargs
+        ) == len(expected)
+
+    def test_group_rejects_nested_or_statically_sharded_members(self) -> None:
+        class _InvalidDatasetItemGroup(DatasetItemGroup):
+            mode: str
+
+            def iter_dataset_items(self):
+                if self.mode == "nested":
+                    yield ArrayDatasetItemGroup(data_groups=[[0]])
+                else:
+                    yield ArrayDatasetItem(data=[0]).shard(2, 0)
+
+        with pytest.raises(TypeError, match="not nested DatasetItemGroup"):
+            DictIterableDataset([_InvalidDatasetItemGroup(mode="nested")])
+        with pytest.raises(ValueError, match="must be unsharded"):
+            DictIterableDataset([_InvalidDatasetItemGroup(mode="sharded")])
+
+    def test_group_ratio_is_independently_rounded_per_member(self) -> None:
+        dataset = DictIterableDataset(
+            [ArrayDatasetItemGroup(data_groups=[[0], [10, 11]])],
+            shuffle=True,
+            generator=torch.Generator().manual_seed(7),
+            resample_ratios=0.5,
+        )
+
+        values = list(dataset)
+
+        assert values in ([10], [11])
+        assert dataset.total_iterator_length == 1
+
+    def test_group_members_keep_existing_batch_boundaries(self) -> None:
+        dataset = DictIterableDataset(
+            [ArrayDatasetItemGroup(data_groups=[[0, 1], [10, 11]])],
+            batch_loader_kwargs=BatchLoaderConfig(batch_size=3),
+        )
+
+        assert [batch.tolist() for batch in dataset] == [[0, 1], [10, 11]]
+        assert (
+            dataset.get_total_batch_num(
+                num_workers=0,
+                batch_size=3,
+                drop_last=False,
+            )
+            == 2
+        )
+
+    def test_group_bounds_and_closes_member_readers(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class _CloseTrackingArrayDataset(ArrayDataset):
+            def __init__(self, data: list[int]) -> None:
+                super().__init__(data)
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        created: list[_CloseTrackingArrayDataset] = []
+
+        def create_closeable_dataset(
+            item: ArrayDatasetItem,
+        ) -> _CloseTrackingArrayDataset:
+            dataset = _CloseTrackingArrayDataset(item.data)
+            created.append(dataset)
+            return dataset
+
+        monkeypatch.setattr(
+            ArrayDatasetItem,
+            "_create_dataset",
+            create_closeable_dataset,
+        )
+        dataset = DictIterableDataset(
+            [ArrayDatasetItemGroup(data_groups=[[0], [1], [2]])],
+            max_dataset_concurrency=1,
+        )
+
+        assert list(dataset) == [0, 1, 2]
+        assert len(created) == 3
+        assert all(member.closed for member in created)
+
+    def test_group_is_a_named_resample_leaf_and_summary_node(self) -> None:
+        dataset = DictIterableDataset(
+            [
+                ArrayDatasetItemGroup(
+                    name="a/b",
+                    data_groups=[[0], [1]],
+                ),
+                ArrayDatasetItem(data=[10, 11], name="a/c"),
+            ],
+            shuffle=True,
+            generator=torch.Generator().manual_seed(7),
+            resample_ratios={"a": 0.5, "a/b": 2.0},
+        )
+
+        values = list(dataset)
+
+        assert dataset._logical_resample_ratios == [2.0, 0.5]
+        assert dataset._resample_ratios == [2.0, 2.0, 0.5]
+        assert len([value for value in values if value < 10]) == 4
+        assert len([value for value in values if value >= 10]) == 1
+        assert "├─ b" in dataset.summary()
+
+    def test_group_worker_shards_preserve_exact_global_target(
+        self,
+    ) -> None:
+        dataset = DictIterableDataset(
+            [ArrayDatasetItemGroup(data_groups=[list(range(7))])],
+            shuffle=True,
+            generator=torch.Generator().manual_seed(7),
+            resample_ratios=2.0,
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=1,
+            num_workers=2,
+            multiprocessing_context=_get_dataloader_multiprocessing_context(2),
+        )
+
+        values = [int(batch.item()) for batch in dataloader]
+
+        assert len(values) == dataset.total_iterator_length == 14
+        assert sorted(values) == sorted([*range(7), *range(7)])
+
+    def test_dict_resample_ratios_resolve_path_prefixes(self):
+        dataset = DictIterableDataset(
+            [
+                ArrayDatasetItem(data=list(range(10)), name="a/b"),
+                ArrayDatasetItem(data=list(range(100, 110)), name="a/c"),
+                ArrayDatasetItem(data=list(range(200, 210)), name="d/e"),
+            ],
+            shuffle=True,
+            generator=torch.Generator().manual_seed(7),
+            resample_ratios={"a": 0.5, "a/b": 2.0},
+        )
+
+        values = list(dataset)
+
+        assert dataset._resample_ratios == [2.0, 0.5, 1.0]
+        assert len([value for value in values if value < 100]) == 20
+        assert len([value for value in values if 100 <= value < 200]) == 5
+        assert len([value for value in values if value >= 200]) == 10
+
+    @pytest.mark.parametrize(
+        "item_names",
+        [
+            ("a", "a/b"),
+            ("a/b", "a"),
+        ],
+    )
+    def test_dict_resample_ratios_reject_non_leaf_item_names(
+        self,
+        item_names: tuple[str, str],
+    ):
+        with pytest.raises(
+            ValueError,
+            match="Dataset item names must be unique leaf paths",
+        ):
+            DictIterableDataset(
+                [
+                    ArrayDatasetItem(data=[0], name=item_names[0]),
+                    ArrayDatasetItem(data=[1], name=item_names[1]),
+                ],
+                shuffle=True,
+                resample_ratios={"a": 1.0},
+            )
+
+    def test_dict_resample_ratios_reject_duplicate_item_names(self):
+        with pytest.raises(
+            ValueError, match="Dataset item names must be unique"
+        ):
+            DictIterableDataset(
+                [
+                    ArrayDatasetItem(data=[0], name="a/b"),
+                    ArrayDatasetItem(data=[1], name="a/b"),
+                ],
+                shuffle=True,
+                resample_ratios={"a": 1.0},
+            )
+
+    @pytest.mark.parametrize(
+        "name,resample_ratios,match",
+        [
+            (None, {"a": 1.0}, "dataset_items\\[0\\]\\.name"),
+            ("a/B", {"a": 1.0}, "dataset_items\\[0\\]\\.name"),
+            ("a/b", {"a/B": 1.0}, "resample_ratios key"),
+            ("a/b", {"a/bb": 1.0}, "does not match any dataset item"),
+        ],
+    )
+    def test_dict_resample_ratios_validate_names_and_rule_coverage(
+        self,
+        name: str | None,
+        resample_ratios: dict[str, float],
+        match: str,
+    ):
+        with pytest.raises(ValueError, match=match):
+            DictIterableDataset(
+                [ArrayDatasetItem(data=[0], name=name)],
+                shuffle=True,
+                resample_ratios=resample_ratios,
+            )
+
+    def test_dict_resample_ratios_validate_rule_ratios(self):
+        with pytest.raises(ValueError, match="resample_ratios\\['a'\\]"):
+            DictIterableDataset(
+                [ArrayDatasetItem(data=[0], name="a/b")],
+                shuffle=True,
+                resample_ratios={"a": 0.0},
+            )
+
+    def test_dict_resample_ratios_require_shuffle_for_non_unit_ratio(self):
+        with pytest.raises(ValueError, match="require shuffle=True"):
+            DictIterableDataset(
+                [ArrayDatasetItem(data=[0], name="a/b")],
+                shuffle=False,
+                resample_ratios={"a": 2.0},
+            )
+
+    def test_dict_resample_ratios_survive_shard_and_clone(self):
+        dataset = DictIterableDataset(
+            [ArrayDatasetItem(data=list(range(10)), name="a/b")],
+            shuffle=True,
+            resample_ratios={"a": 2.0},
+        )
+
+        sharded = dataset.shard(num_shards=2, index=1)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=3,
+            use_dataset_side_batching=True,
+        )
+
+        assert sharded._resample_ratios == [2.0]
+        assert dataloader.dataset._resample_ratios == [2.0]
+
     @pytest.mark.parametrize(
         "resample_ratios,exception",
         [
@@ -965,27 +1402,6 @@ class TestDictIterableDataset(TestIterableDatasetMixin):
                 datasets,
                 shuffle=False,
                 resample_ratios=resample_ratios,
-            )
-
-    @pytest.mark.parametrize(
-        "dataset_names,exception",
-        [
-            ([], ValueError),
-            (["only_one"], ValueError),
-            ("one_string", TypeError),
-            (["valid", 1], TypeError),
-        ],
-    )
-    def test_dataset_names_validate_public_contract(
-        self,
-        dummy_dataset_items: list[DatasetItem],
-        dataset_names: Any,
-        exception: type[Exception],
-    ):
-        with pytest.raises(exception):
-            DictIterableDataset(
-                dummy_dataset_items,
-                dataset_names=dataset_names,
             )
 
     def test_zero_target_items_are_skipped_without_zero_weight_division(self):
@@ -1071,15 +1487,14 @@ class TestDictIterableDataset(TestIterableDatasetMixin):
         with pytest.raises(RuntimeError, match="produced no rows"):
             list(dataset)
 
-    def test_resample_metadata_survives_shard_and_dataloader_clone(
-        self,
-        dummy_dataset_items: list[DatasetItem],
-    ):
+    def test_resample_metadata_and_item_names_survive_shard_and_clone(self):
         dataset = DictIterableDataset(
-            dummy_dataset_items,
+            [
+                ArrayDatasetItem(data=list(range(10)), name="first"),
+                ArrayDatasetItem(data=list(range(100, 110)), name="second"),
+            ],
             shuffle=True,
             resample_ratios=[0.5, 2.0],
-            dataset_names=["first", "second"],
         )
 
         sharded = dataset.shard(num_shards=2, index=1)
@@ -1090,47 +1505,154 @@ class TestDictIterableDataset(TestIterableDatasetMixin):
         )
 
         assert sharded._resample_ratios == [0.5, 2.0]
-        assert sharded._dataset_names == ["first", "second"]
+        assert [item.name for item in sharded.dataset_items] == [
+            "first",
+            "second",
+        ]
         assert isinstance(dataloader.dataset, DictIterableDataset)
         assert dataloader.dataset._resample_ratios == [0.5, 2.0]
-        assert dataloader.dataset._dataset_names == ["first", "second"]
+        assert [item.name for item in dataloader.dataset.dataset_items] == [
+            "first",
+            "second",
+        ]
 
-    def test_summary_reports_resampled_and_real_sharded_ratios(self):
+    def test_summary_reports_tree_aggregates_and_leaf_resample_ratios(self):
         dataset = DictIterableDataset(
             [
-                ArrayDatasetItem(data=list(range(10))),
-                ArrayDatasetItem(data=list(range(10, 20))),
+                ArrayDatasetItem(data=list(range(10)), name="a/b"),
+                ArrayDatasetItem(data=list(range(10, 20)), name="a/c"),
+                ArrayDatasetItem(data=list(range(20, 30)), name="d/e"),
             ],
             shuffle=True,
-            resample_ratios=[1.0, 3.0],
-            dataset_names=["aaa", "数\n据"],
+            resample_ratios=[2.0, 0.5, 1.0],
         )
 
-        summary = dataset.summary()
-        lines = summary.splitlines()
+        assert dataset.summary() == "\n".join(
+            [
+                "name                           sample_ratio [frame_ratio] "
+                "[length] resample_ratio [resampled_length]",
+                "├─ a                                 71.43% [     66.67%] "
+                "[    20]              — [              25]",
+                "│  ├─ b                              57.14% [     33.33%] "
+                "[    10]             ×2 [              20]",
+                "│  └─ c                              14.29% [     33.33%] "
+                "[    10]           ×0.5 [               5]",
+                "├─ d/e                               28.57% [     33.33%] "
+                "[    10]             ×1 [              10]",
+                "└─ total                            100.00% [    100.00%] "
+                "[    30]              — [              35]",
+            ]
+        )
 
-        assert len(lines) == 4
-        assert lines[0].startswith(" " * 28 + "name sample_ratio")
-        assert "[frame_ratio]" in lines[0]
-        assert lines[1].startswith("├" + "-" * 27 + "aaa:")
-        assert lines[2].startswith("├" + "-" * 25 + "数_据:")
-        assert "25.00%" in lines[1]
-        assert "75.00%" in lines[2]
-        assert "50.00%" in lines[1]
-        assert "50.00%" in lines[2]
-        assert lines[3].endswith("[    20]")
-        assert lines[0].index("name") + len("name") == (
-            lines[1].index(":") + 1
+    def test_summary_displays_raw_and_resampled_lengths(self):
+        dataset = DictIterableDataset(
+            [
+                ArrayDatasetItem(data=list(range(128)), name=name)
+                for name in ("libero", "robotwin", "robodojo", "horizon")
+            ],
+            shuffle=True,
+            resample_ratios={"horizon": 0.1734178109542776},
         )
-        assert lines[0].index("sample_ratio") + len("sample_ratio") == (
-            lines[1].index("25.00%") + len("25.00%")
+
+        lines = dataset.summary().splitlines()
+
+        assert lines[-1].startswith("└─ total")
+        assert "[   512]" in lines[-1]
+        assert lines[-1].endswith("[             406]")
+        horizon = next(line for line in lines if "horizon" in line)
+        assert "[   128]" in horizon
+        assert horizon.endswith("[              22]")
+        assert "×0.17342" in horizon
+        assert "0.1734178109542776" not in horizon
+        assert dataset.total_iterator_length == 406
+
+    def test_summary_resampled_length_uses_physical_member_rounding(self):
+        dataset = DictIterableDataset(
+            [ArrayDatasetItemGroup(name="group", data_groups=[[0], [1], [2]])],
+            shuffle=True,
+            resample_ratios={"group": 0.5},
         )
-        assert lines[0].index("frame_ratio") + len("frame_ratio") == (
-            lines[1].index("50.00%") + len("50.00%")
+
+        assert "[     3]" in dataset.summary().splitlines()[-1]
+        assert (
+            dataset.summary().splitlines()[-1].endswith("[               0]")
         )
-        assert lines[0].index("length") + len("length") == (
-            lines[1].index("10") + len("10")
+        assert dataset.total_iterator_length == 0
+
+    def test_summary_displays_overlapping_and_duplicate_item_names(self):
+        dataset = DictIterableDataset(
+            [
+                ArrayDatasetItem(data=list(range(8)), name="a"),
+                ArrayDatasetItem(data=list(range(8, 16)), name="a/b"),
+                ArrayDatasetItem(data=list(range(16, 24)), name="a/b"),
+            ],
+            shuffle=True,
+            resample_ratios=[1.0, 2.0, 0.5],
         )
+
+        assert dataset.summary() == "\n".join(
+            [
+                "name                           sample_ratio [frame_ratio] "
+                "[length] resample_ratio [resampled_length]",
+                "├─ a                                100.00% [    100.00%] "
+                "[    24]              — [              28]",
+                "│  ├─ (self)                         28.57% [     33.33%] "
+                "[     8]             ×1 [               8]",
+                "│  └─ b                              71.43% [     66.67%] "
+                "[    16]              — [              20]",
+                "│     ├─ (self #0)                   57.14% [     33.33%] "
+                "[     8]             ×2 [              16]",
+                "│     └─ (self #1)                   14.29% [     33.33%] "
+                "[     8]           ×0.5 [               4]",
+                "└─ total                            100.00% [    100.00%] "
+                "[    24]              — [              28]",
+            ]
+        )
+
+    def test_summary_escapes_and_displays_malformed_legacy_names(self):
+        dataset = DictIterableDataset(
+            [
+                ArrayDatasetItem(data=[0]),
+                ArrayDatasetItem(data=[1], name="root/"),
+                ArrayDatasetItem(data=[2], name="root//child"),
+                ArrayDatasetItem(data=[3], name="robot\narm"),
+            ]
+        )
+
+        assert dataset.summary() == "\n".join(
+            [
+                "name                           sample_ratio [frame_ratio] "
+                "[length] resample_ratio [resampled_length]",
+                "├─ (unnamed #0)                      25.00% [     25.00%] "
+                "[     1]             ×1 [               1]",
+                "├─ root/(empty)                      50.00% [     50.00%] "
+                "[     2]              — [               2]",
+                "│  ├─ (self)                         25.00% [     25.00%] "
+                "[     1]             ×1 [               1]",
+                "│  └─ child                          25.00% [     25.00%] "
+                "[     1]             ×1 [               1]",
+                "├─ robot\\narm                        25.00% [     25.00%] "
+                "[     1]             ×1 [               1]",
+                "└─ total                            100.00% [    100.00%] "
+                "[     4]              — [               4]",
+            ]
+        )
+
+    def test_path_tree_helper_preserves_order_and_compacts_single_paths(self):
+        root, root_item_labels = _build_path_tree(
+            [None, "b", "b/c", "b/c", "a", "d/e"]
+        )
+
+        assert _format_path_tree(root, root_item_labels) == [
+            ("├─ (unnamed #0)", (0,), 0),
+            ("├─ b", (1, 2, 3), None),
+            ("│  ├─ (self)", (1,), 1),
+            ("│  └─ c", (2, 3), None),
+            ("│     ├─ (self #0)", (2,), 2),
+            ("│     └─ (self #1)", (3,), 3),
+            ("├─ a", (4,), 4),
+            ("├─ d/e", (5,), 5),
+        ]
 
     def test_summary_handles_an_empty_shard(self):
         dataset = DictIterableDataset(
@@ -1140,9 +1662,10 @@ class TestDictIterableDataset(TestIterableDatasetMixin):
 
         summary = dataset.summary()
 
-        assert "item_0" in summary
+        assert "(unnamed #0)" in summary
         assert summary.count("0.00%") == 4
-        assert summary.splitlines()[-1].endswith("[     0]")
+        assert "[     0]" in summary.splitlines()[-1]
+        assert "— [               0]" in summary.splitlines()[-1]
 
     def test_dataloader_item_consistency(
         self, dummy_dataset_items: list[DatasetItem]
@@ -1328,8 +1851,14 @@ class TestDictIterableDataset(TestIterableDatasetMixin):
         def fake_prepare_dataset_for_iter(
             cur_dataset_iters: list[tuple[int, Any]],
             remaining_dataset_indices: list[int],
+            make_iter,
+            worker_targets,
+            segment_remaining,
+            offload_cursors,
         ) -> list[float]:
-            del remaining_dataset_indices
+            del remaining_dataset_indices, make_iter
+            del worker_targets, offload_cursors
+            segment_remaining.update({0: 2, 1: 2})
             if not cur_dataset_iters:
                 cur_dataset_iters.extend(
                     [(0, child_iters[0]), (1, child_iters[1])]
@@ -1744,13 +2273,34 @@ class TestDictIterableDataset(TestIterableDatasetMixin):
         assert dataloader.dataset.batch_loader_kwargs.drop_last is True
         assert len(list(dataloader)) == len(dataloader)
 
-    def test_dataset_item_shard_uses_accelerate_signature(self):
-        item = ArrayDatasetItem(data=list(range(10)))
+    def test_dataset_item_name_is_optional_and_survives_sharding(self):
+        unnamed_item = ArrayDatasetItem(data=[0])
+        item = ArrayDatasetItem(data=list(range(10)), name="source/action")
 
         sharded_item = item.shard(num_shards=3, index=1)
+        restored_item = ArrayDatasetItem.model_validate(item.model_dump())
 
+        assert unnamed_item.name is None
+        assert item.model_dump()["name"] == "source/action"
+        assert restored_item.name == "source/action"
+        assert sharded_item.name == "source/action"
         assert sharded_item.num_shards == 3
         assert sharded_item.shard_id == 1
+
+    def test_dict_iterable_summary_reads_current_dataset_item_names(self):
+        named_item = ArrayDatasetItem(data=[0], name="named")
+        dataset = DictIterableDataset(
+            [
+                named_item,
+                ArrayDatasetItem(data=[1]),
+            ]
+        )
+        named_item.name = "renamed"
+
+        summary = dataset.summary()
+
+        assert "renamed" in summary
+        assert "(unnamed #1)" in summary
 
     def test_dict_iterable_shard_uses_accelerate_signature(
         self, dummy_dataset_items: list[DatasetItem]
@@ -3214,6 +3764,88 @@ class TestCreatePrefetchIterator:
         assert failure_branch_reached.wait(timeout=1)
         with pytest.raises(RuntimeError, match="producer failed"):
             next(prefetch_iter)
+
+
+class TestPreparedLoaderFailureCleanup:
+    @pytest.mark.parametrize("fail_index", [0, 2])
+    def test_failed_generator_closes_only_its_owned_workers(self, fail_index):
+        """Retained error tracebacks release workers and leave peers active."""
+        values = list(range(8))
+        values[fail_index] = None
+        loaders = [
+            prepare_data_loader(
+                TorchDataLoader(
+                    ArrayDataset(data=data),
+                    batch_size=1,
+                    num_workers=1,
+                    persistent_workers=False,
+                    multiprocessing_context=(
+                        _get_dataloader_multiprocessing_context(1)
+                    ),
+                    generator=torch.Generator().manual_seed(0),
+                ),
+                device=torch.device("cpu"),
+                num_processes=1,
+                process_index=0,
+                put_on_device=True,
+                dispatch_batches=False,
+                split_batches=False,
+                even_batches=False,
+            )
+            for data in (list(range(16)), values)
+        ]
+        peer, failed = loaders
+        gradient_state = peer.gradient_state
+        initial_active_loader = gradient_state.active_dataloader
+        peer_iter, failed_iter = iter(peer), iter(failed)
+        primary_exc = None
+        baseline_pids = {process.pid for process in mp.active_children()}
+        try:
+            assert next(peer_iter).tolist() == [0]
+            peer_pids = {process.pid for process in mp.active_children()}
+            with pytest.raises(TypeError, match="NoneType") as caught:
+                list(failed_iter)
+            primary_exc = caught.value
+            assert failed_iter.gi_frame is None
+            failed_pids = {
+                process.pid for process in mp.active_children()
+            } - peer_pids
+            assert failed_pids
+            # The same iterator code/dataset with a different owner is not
+            # enough to claim the exited generator's retained worker iterator.
+            close_dataloader_resources(
+                SimpleNamespace(dataset=failed.dataset),
+                failed_iter,
+                reason=DataloaderCloseReason.EXCEPTION_ABORT,
+                primary_exc=primary_exc,
+            )
+            assert failed_pids <= {
+                process.pid for process in mp.active_children()
+            }
+            close_dataloader_resources(
+                failed,
+                failed_iter,
+                reason=DataloaderCloseReason.EXCEPTION_ABORT,
+                primary_exc=primary_exc,
+            )
+            assert {
+                process.pid for process in mp.active_children()
+            } == peer_pids
+            assert next(peer_iter).tolist() == [1]
+        finally:
+            close_dataloader_resources(
+                failed,
+                failed_iter,
+                reason=DataloaderCloseReason.EXCEPTION_ABORT,
+                primary_exc=primary_exc,
+            )
+            close_dataloader_resources(
+                peer, peer_iter, reason=DataloaderCloseReason.EARLY_BREAK
+            )
+        assert {
+            process.pid for process in mp.active_children()
+        } == baseline_pids
+        assert gradient_state.active_dataloader is initial_active_loader
 
 
 class TestDataLoaderEarlyBreakCleanup:

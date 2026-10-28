@@ -61,12 +61,16 @@ Local agent asset index lives in `.agents/README.md`.
   recreate State, or RoboTwin compatibility rules:
   `.agents/references/robotwin-env-guideline.md`
 - RODataset metadata schema, `Task.info`, `InstructionData.json_content`,
-  `EpisodeData.info`, metadata parsing, or metadata export:
+  `EpisodeData.info`, metadata parsing or export, merged-dataset frame-index
+  offsets, or `Episode.dataset_begin_index` global/sentinel contracts:
   `.agents/references/rodataset-metadata-guideline.md`
 - RODataset read-time ImageEncoded materialization, batch or MultiRow read
   semantics, `RODatasetItem` reader options, or stored-schema versus runtime
   value contracts:
   `.agents/references/rodataset-reader-materialization-guideline.md`
+- `DictIterableDataset` offload, finite reader residency, prefetch teardown,
+  prepared DataLoader worker cleanup, or lifecycle/memory evidence:
+  `.agents/references/iterable-dataset-lifecycle-guideline.md`
 - Experimental MCAP export, `Dict2Mcap`, `Dataset2Mcap`,
   `FoxgloveMcapWriter`, `FoxgloveEncoder`, `StampedMessage` topic maps,
   converter contracts, or Pydantic JSON topics:
@@ -81,8 +85,9 @@ Local agent asset index lives in `.agents/README.md`.
 - RODataset metadata database table upgrades, deprecated ORM shapes, fixed
   legacy fixtures, or persisted identity changes:
   `.agents/references/rodataset-upgrade-guideline.md`
-- Key interface docstrings for public classes/functions or boundary helpers
-  whose safe use is not obvious from the signature alone, including
+- Key interface docstrings for public classes/functions or boundary helpers,
+  or key module variables, class attributes, and instance attributes whose
+  safe use is not obvious from the signature or assignment alone, including
   resource-owning or stateful interfaces: start with
   `.agents/references/interface-docstring-guideline.md`; use
   `.agents/templates/interface-docstring-scaffold.md` only when a short

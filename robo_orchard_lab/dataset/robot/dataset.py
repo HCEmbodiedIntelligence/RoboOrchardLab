@@ -27,6 +27,7 @@ from typing import (
     Any,
     Callable,
     Iterable,
+    Iterator,
     Literal,
     Mapping,
     Sequence,
@@ -61,6 +62,7 @@ from robo_orchard_lab.dataset.robot.dataset_db_engine import (
 )
 from robo_orchard_lab.dataset.robot.dataset_ex import (
     DatasetItem,
+    DatasetItemGroup,
 )
 from robo_orchard_lab.dataset.robot.db_orm import (
     Episode,
@@ -81,6 +83,7 @@ __all__ = [
     "ROMultiRowDataset",
     "ConcatRODataset",
     "RODatasetItem",
+    "RODatasetItemGroup",
     "_complete_dataset_info",
     "get_row_num_from_dataset_info",
 ]
@@ -161,6 +164,12 @@ class RODataset(TorchDataset):
 
 
     Note:
+        Path construction snapshots ``ROBO_ORCHARD_DB_LOCK_FREE_READ`` once.
+        When enabled, completed immutable DuckDB inputs are copied locally
+        and SQLite inputs use immutable reads. Views and pickle restoration
+        retain the resource's selection. Wrapping an already opened engine
+        with :meth:`from_dataset` does not activate or migrate that engine.
+
         The dataset loading process will automatically check the version of the
         meta database, and upgrade it to the latest version if necessary.
         Please call the `RODataset.upgrade_meta(dataset_path)` method to
@@ -216,6 +225,7 @@ class RODataset(TorchDataset):
         ) = None,
     ):
         dataset_path = os.path.expanduser(dataset_path)
+        lock_free_read = self._get_db_lock_free_read_enabled()
 
         from robo_orchard_lab.dataset.robot._hf_dataset import (
             load_from_disk,
@@ -253,7 +263,10 @@ class RODataset(TorchDataset):
             "dataset_format_version", None
         )
         # load db
-        self.db_engine = self._load_db(dataset_path)
+        self._db_resource = _RODatasetDBResource(
+            self._load_db(dataset_path, _lock_free_read=lock_free_read),
+            _lock_free_read=lock_free_read,
+        )
 
         self._transform: Callable[[dict], dict] | None = None
 
@@ -549,9 +562,31 @@ class RODataset(TorchDataset):
 
         self.close()
 
-    def _load_db(self, dataset_path: str) -> Engine:
+    @staticmethod
+    def _get_db_lock_free_read_enabled() -> bool:
+        """Read ``ROBO_ORCHARD_DB_LOCK_FREE_READ`` for a new path reader.
+
+        Unset, empty and ``0`` disable it; ``1`` enables it.
+
+        Raises:
+            ValueError: If the variable has another nonempty value.
+        """
+        value = os.environ.get("ROBO_ORCHARD_DB_LOCK_FREE_READ", "")
+        if value in ("", "0"):
+            return False
+        if value == "1":
+            return True
+        raise ValueError(
+            "ROBO_ORCHARD_DB_LOCK_FREE_READ must be unset, empty, '0' or '1'."
+        )
+
+    def _load_db(
+        self, dataset_path: str, *, _lock_free_read: bool = False
+    ) -> Engine:
         return create_engine(
-            url=_get_dataset_db_url(dataset_path), readonly=True
+            url=_get_dataset_db_url(dataset_path),
+            readonly=True,
+            _lock_free_read=_lock_free_read,
         )
 
     @staticmethod
@@ -1673,7 +1708,13 @@ class RODatasetItem(DatasetItem[RODataset]):
         return kwargs
 
     def get_dataset_row_num(self) -> int:
-        """Get the number of rows in the dataset."""
+        """Return this physical dataset's row count without retaining a reader.
+
+        Prefer the packaged dataset metadata when it contains a count. If it
+        does not, construct and close a reader long enough to obtain ``len``.
+        ``RODatasetItemGroup`` uses this same per-path operation when it
+        aggregates its member count.
+        """
         reader_init_kwargs = self._reader_init_kwargs()
         rows = get_row_num_from_dataset_info(
             dataset_path=self.dataset_path,
@@ -1690,13 +1731,103 @@ class RODatasetItem(DatasetItem[RODataset]):
         dataset.set_transform(self.transform)
         return dataset
 
+    def get_index_cache_key(self) -> str:
+        """Reuse base indices across post-read transforms, including callables.
+
+        Transform configuration does not change the original row anchors.
+        All reader/source options remain part of the default key.
+        """
+        return DatasetItem.get_index_cache_key(self.replace(transform=None))
+
+
+class RODatasetItemGroup(DatasetItemGroup):
+    """Expose compatible RODataset roots as one logical mixture input.
+
+    This has the same reader configuration as :class:`RODatasetItem`, except
+    that ``dataset_path`` is an ordered list of physical roots. Use it when
+    those roots should share one ``name``, one resample rule, and one summary
+    leaf in :class:`~.dataset_ex.DictIterableDataset`.
+
+    The group is configuration only. It does not concatenate roots, create a
+    long-lived reader, or batch across roots. At mixture construction each path
+    becomes a fresh unsharded :class:`RODatasetItem`; runtime readers,
+    scheduler entries, worker shards, and final batches remain per-path.
+
+    For example, a more-specific dict rule overrides its parent rule for the
+    logical group name, then applies independently to both physical paths::
+
+        from robo_orchard_lab.dataset.robot.dataset_ex import (
+            DictIterableDataset,
+        )
+
+        bridge = RODatasetItemGroup(
+            name="open_x/bridge",
+            dataset_path=["/datasets/bridge-000", "/datasets/bridge-001"],
+        )
+        mixture = DictIterableDataset(
+            datasets=[bridge],
+            shuffle=True,
+            resample_ratios={"open_x": 0.5, "open_x/bridge": 2.0},
+        )
+
+    Each path targets ``round(its_own_sharded_rows * 2.0)``. ``summary()``
+    shows ``open_x/bridge`` once and aggregates both paths under that logical
+    leaf. This class does not support nested ``DatasetItemGroup`` values.
+    """
+
+    class_type: ClassType[RODataset] = RODataset
+    dataset_path: list[str] = Field(
+        min_length=1,
+        description=(
+            "Ordered physical RODataset roots. Each path becomes one fresh "
+            "physical RODatasetItem under this logical group."
+        ),
+    )
+    storage_options: dict | None = None
+    meta_index2meta: bool = False
+    image_decode_options: RODatasetImageDecodeOptions | None = None
+    transform: Callable | None = None
+    reader_init_kwargs: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_reader_contract(self) -> Self:
+        """Validate every deferred leaf against the reader constructor.
+
+        This checks configuration signatures only; it does not open a
+        dataset reader or merge the configured paths.
+        """
+
+        for item in self.iter_dataset_items():
+            item._reader_init_kwargs()
+        return self
+
+    def iter_dataset_items(self) -> Iterator[RODatasetItem]:
+        """Yield fresh unsharded physical items in ``dataset_path`` order.
+
+        The generated leaves intentionally have no names or static shards.
+        ``DatasetItemGroup`` owns the logical name and applies its static shard
+        independently to every leaf when the mixture is constructed.
+        """
+
+        for dataset_path in self.dataset_path:
+            yield RODatasetItem(
+                class_type=self.class_type,
+                dataset_path=dataset_path,
+                storage_options=self.storage_options,
+                meta_index2meta=self.meta_index2meta,
+                image_decode_options=self.image_decode_options,
+                transform=self.transform,
+                reader_init_kwargs=self.reader_init_kwargs,
+            )
+
 
 @dataclass(slots=True)
 class _RODatasetDBResource:
-    """Share one terminal metadata-engine lifecycle across dataset views."""
+    """Share a metadata-engine lifecycle and its fixed private read policy."""
 
     engine: Engine
     closed: bool = False
+    _lock_free_read: bool = False
 
     @property
     def active_engine(self) -> Engine:
@@ -1722,12 +1853,20 @@ class _RODatasetDBResource:
 
         if self.closed:
             raise RuntimeError("Cannot pickle a closed RODataset resource.")
-        return {"db_engine_url": self.engine.url}
+        return {
+            "db_engine_url": self.engine.url,
+            "_lock_free_read": self._lock_free_read,
+        }
 
     def __setstate__(self, state: dict) -> None:
         """Recreate a process-local engine for one unpickled resource graph."""
 
-        self.engine = create_engine(state["db_engine_url"], readonly=True)
+        self._lock_free_read = state.get("_lock_free_read", False)
+        self.engine = create_engine(
+            state["db_engine_url"],
+            readonly=True,
+            _lock_free_read=self._lock_free_read,
+        )
         self.closed = False
 
 
