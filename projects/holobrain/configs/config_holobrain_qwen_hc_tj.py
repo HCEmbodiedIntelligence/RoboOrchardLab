@@ -41,7 +41,7 @@ __all__ = [
 
 config = copy.deepcopy(_common_config)
 config.update(
-    training_datasets=["hc_tj"],
+    training_datasets=["hc_tj","hc_tj_1020_test"],
     deploy_datasets=["hc_tj"],
     batch_size=1,
     step_log_freq=50,
@@ -52,13 +52,15 @@ config.update(
     warmup_steps=300,
     decay_steps=int(1e5),
     decay_lr=2.5e-6,
-    async_inference_plugin={
+    dataset_sample_weights=[5,1]
+)
+config["async_inference_plugin"]=={
         "type": (
             "robo_orchard_lab.models.rtc_plugin.rtc_plugin:RTCInferencePlugin"
         ),
         "max_horizon": 32,
-    },
-)
+    }, #noqa: E501
+
 
 
 def cosine_decay_with_warmup_scheduler_build(
