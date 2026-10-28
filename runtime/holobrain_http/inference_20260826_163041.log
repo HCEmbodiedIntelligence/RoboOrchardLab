@@ -1,14 +1,0 @@
-/home/maple/test/RoboOrchardLab/.venv/lib/python3.10/site-packages/datasets/utils/experimental.py:37: UserWarning: 'register_feature' is experimental and might be subject to breaking changes in the future.
-  warnings.warn(
-Use default teacher_forcing_mean_steps: 16
-`torch_dtype` is deprecated! Use `dtype` instead!
-Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00, 39.25it/s]
-/home/maple/test/RoboOrchardLab/robo_orchard_lab/models/holobrain/structure.py:436: FutureWarning: Positional args are being deprecated, use kwargs instead. Refer to https://pytorch.org/docs/main/generated/torch.nn.Module.html#torch.nn.Module.state_dict for details.
-  state_dict = super().state_dict(*args, destination, prefix, keep_vars)
-2026-08-26 16:30:50,200 INFO | 224052 | MainThread | LoggerManager.__main__:L102 Model server holobrain started on port 2000
-::ffff:127.0.0.1 - - [2026-08-26 16:30:50] "GET / HTTP/1.1" 404 331 0.001328
-::ffff:127.0.0.1 - - [2026-08-26 16:30:51] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 21669 0.778659
-::ffff:127.0.0.1 - - [2026-08-26 16:30:52] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 21528 0.190947
-::ffff:127.0.0.1 - - [2026-08-26 16:30:52] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 21409 0.189393
-::ffff:127.0.0.1 - - [2026-08-26 16:30:53] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 21345 0.193140
-::ffff:127.0.0.1 - - [2026-08-26 16:30:53] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 21265 0.195385
