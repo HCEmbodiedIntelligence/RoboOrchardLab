@@ -1,0 +1,31 @@
+/home/maple/test/RoboOrchardLab/.venv/lib/python3.10/site-packages/datasets/utils/experimental.py:37: UserWarning: 'register_feature' is experimental and might be subject to breaking changes in the future.
+  warnings.warn(
+Use default teacher_forcing_mean_steps: 16
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00, 40.46it/s]
+/home/maple/test/RoboOrchardLab/robo_orchard_lab/models/holobrain/structure.py:436: FutureWarning: Positional args are being deprecated, use kwargs instead. Refer to https://pytorch.org/docs/main/generated/torch.nn.Module.html#torch.nn.Module.state_dict for details.
+  state_dict = super().state_dict(*args, destination, prefix, keep_vars)
+2026-08-26 16:53:18,552 INFO | 237935 | MainThread | LoggerManager.__main__:L102 Model server holobrain started on port 2000
+::ffff:127.0.0.1 - - [2026-08-26 16:53:19] "GET / HTTP/1.1" 404 331 0.001759
+::ffff:127.0.0.1 - - [2026-08-26 16:53:20] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 21444 0.756706
+::ffff:127.0.0.1 - - [2026-08-26 16:53:20] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 21368 0.184299
+::ffff:127.0.0.1 - - [2026-08-26 16:53:21] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 21310 0.181427
+::ffff:127.0.0.1 - - [2026-08-26 16:53:21] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 21299 0.183830
+::ffff:127.0.0.1 - - [2026-08-26 16:53:22] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 21208 0.186475
+::ffff:127.0.0.1 - - [2026-08-26 16:53:22] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 21126 0.192979
+::ffff:127.0.0.1 - - [2026-08-26 16:53:23] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 21130 0.191078
+::ffff:127.0.0.1 - - [2026-08-26 16:53:23] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 21074 0.184444
+::ffff:127.0.0.1 - - [2026-08-26 16:53:24] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 20969 0.182421
+::ffff:127.0.0.1 - - [2026-08-26 16:53:25] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 20961 0.179977
+::ffff:127.0.0.1 - - [2026-08-26 16:53:25] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 20935 0.188116
+::ffff:127.0.0.1 - - [2026-08-26 16:53:26] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 20851 0.187840
+::ffff:127.0.0.1 - - [2026-08-26 16:53:26] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 20907 0.187042
+::ffff:127.0.0.1 - - [2026-08-26 16:53:27] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 20902 0.190281
+::ffff:127.0.0.1 - - [2026-08-26 16:53:27] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 20918 0.185075
+::ffff:127.0.0.1 - - [2026-08-26 16:53:28] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 20959 0.193353
+::ffff:127.0.0.1 - - [2026-08-26 16:53:29] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 21006 0.190043
+::ffff:127.0.0.1 - - [2026-08-26 16:53:29] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 21036 0.184230
+::ffff:127.0.0.1 - - [2026-08-26 16:53:30] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 21066 0.188462
+::ffff:127.0.0.1 - - [2026-08-26 16:53:30] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 21069 0.211548
+::ffff:127.0.0.1 - - [2026-08-26 16:53:31] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 21011 0.184036
+::ffff:127.0.0.1 - - [2026-08-26 16:53:32] "POST /holobrain/hc_tj_async/v1 HTTP/1.1" 200 21023 0.402950

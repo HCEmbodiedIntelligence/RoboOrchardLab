@@ -19,8 +19,9 @@
 from __future__ import annotations
 import json
 import math
+import time
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -81,11 +82,33 @@ RIGHT_HAND_JOINT_NAMES = (
     "R_pinky_pip_joint",
 )
 RIGHT_HAND_OPEN = np.asarray(
-    [0.4, -1.642, 0.0, -0.13, 0.0, 0.0, 0.05, 0.0, 0.05, 0.0],
+    [
+        0.46475,
+        -1.642,
+        0.0,
+        -0.08708984375,
+        0.0,
+        0.0,
+        0.13,
+        0.0,
+        0.13,
+        0.0,
+    ],
     dtype=np.float64,
 )
 RIGHT_HAND_CLOSED = np.asarray(
-    [1.121, 0.045, 1.0, -0.05, 2.5, 2.5, 0.13, 2.5, 0.13, 2.5],
+    [
+        0.46475,
+        -1.642,
+        0.98388671875,
+        -0.08708984375,
+        1.09619140625,
+        1.09619140625,
+        0.087734375,
+        2.13134765625,
+        0.0891015625,
+        2.2509765625,
+    ],
     dtype=np.float64,
 )
 LEFT_HAND_JOINT_NAMES = (
@@ -101,11 +124,33 @@ LEFT_HAND_JOINT_NAMES = (
     "L_pinky_pip_joint",
 )
 LEFT_HAND_OPEN = np.asarray(
-    [-0.4, -0.045, 0.0, 0.05, 0.0, 0.0, -0.13, 0.0, -0.13, 0.0],
+    [
+        -0.46475,
+        -0.045,
+        0.0,
+        0.09291015625,
+        0.0,
+        0.0,
+        -0.05,
+        0.0,
+        0.05,
+        0.0,
+    ],
     dtype=np.float64,
 )
 LEFT_HAND_CLOSED = np.asarray(
-    [-1.121, 1.642, -1.0, 0.13, 2.5, 2.5, -0.05, 2.5, 0.05, 2.5],
+    [
+        -0.46475,
+        -0.045,
+        -0.98388671875,
+        0.09291015625,
+        1.09619140625,
+        1.09619140625,
+        -0.092265625,
+        2.13134765625,
+        -0.042021484375,
+        2.2509765625,
+    ],
     dtype=np.float64,
 )
 
@@ -116,10 +161,19 @@ class ProtocolError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class TimedValue:
-    """Pair a value with its ROS header timestamp in nanoseconds."""
+    """Pair an observation's source time with its local receive time.
+
+    ``timestamp_ns`` belongs to the ROS publisher clock and is used only to
+    synchronize robot-originated streams. ``received_monotonic_s`` belongs to
+    the receiving process and is the safe clock for freshness checks across
+    hosts that may not have synchronized wall clocks.
+    """
 
     timestamp_ns: int
     value: Any
+    received_monotonic_s: float = field(
+        default_factory=time.monotonic, compare=False
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,7 +410,12 @@ def arm_actions(actions: np.ndarray) -> np.ndarray:
 def hand_command(
     side: str, closure: float
 ) -> tuple[tuple[str, ...], np.ndarray]:
-    """Map binary closure to a complete 10-axis hand command."""
+    """Map closure to the OmniHand driver's calibrated open/fist poses.
+
+    The joint-space endpoints are the inverse of HC_X1's ``FingerMapping``
+    for ``vrTriggerOpenMotorPos`` and ``vrTriggerFistMotorPos``.  They avoid
+    driving every finger to its mechanical mapping limit at closure 1.
+    """
     value = float(np.clip(closure, 0.0, 1.0))
     if side == "right":
         return RIGHT_HAND_JOINT_NAMES, (

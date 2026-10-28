@@ -52,7 +52,12 @@ config.update(
     warmup_steps=300,
     decay_steps=int(1e5),
     decay_lr=2.5e-6,
-    prediction_type="absolute_joint_relative_pose",
+    async_inference_plugin={
+        "type": (
+            "robo_orchard_lab.models.rtc_plugin.rtc_plugin:RTCInferencePlugin"
+        ),
+        "max_horizon": 32,
+    },
 )
 
 
