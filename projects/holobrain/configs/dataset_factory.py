@@ -98,9 +98,9 @@ def build_validation_dataset(config, lazy_init=False):
         return dataset
 
 
-def build_processors(config):
+def build_processors(config,**kwargs):
     apply_dataset_register()
     processors = {}
     for build_func in PROCESSOR_BUILD_FUNCS:
-        processors.update(build_func(config, config["deploy_datasets"]))
+        processors.update(build_func(config, config["deploy_datasets"], **kwargs))
     return processors
