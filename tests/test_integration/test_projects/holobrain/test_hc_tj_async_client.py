@@ -202,7 +202,7 @@ def motion_info():
     )
 
 
-def send_state(node, ros, state="AUTO", epoch=1):
+def send_state(node, ros, state="AUTO", epoch=1, dagger_enabled=True):
     msg = ros.Message()
     msg.data = json.dumps(
         dict(
@@ -213,6 +213,7 @@ def send_state(node, ros, state="AUTO", epoch=1):
             state=state,
             phase="grant" if state == "AUTO" else "revoke",
             source="motion",
+            dagger_enabled=dagger_enabled,
             published_stamp_ns=node.now_ns,
         )
     )
@@ -430,6 +431,219 @@ def test_trimmed_jump_reports_joint_and_raw_prediction(config, ros):
 
 
 class TestDaggerBoundary:
+    @pytest.mark.parametrize(
+        ("latency", "camera_timeout", "accepted"),
+        [(0.24498, 1.0, True), (0.45, 1.0, False), (0.24498, 0.2, False)],
+    )
+    def test_first_dagger_chunk_starts_from_feedback(
+        self, config, ros, monkeypatch, latency, camera_timeout, accepted
+    ):
+        node = ros.create(
+            config(
+                enable_dagger=True,
+                control_token="x" * 16,
+                enable_control=True,
+                first_point_jump_rad=0.6,
+                camera_timeout_s=camera_timeout,
+            )
+        )
+        send_state(node, ros)
+        node.now_ns += 1
+        send_state(node, ros, "HOLD", 2)
+        node.now_ns += 1
+        send_state(node, ros, "AUTO", 3)
+        clock = time.monotonic() + 0.001
+        monkeypatch.setattr(client.time, "monotonic", lambda: clock)
+        node.now_ns += 1
+        joints = np.array(client.DEFAULT_JOINT_POSITIONS)
+        joints[3] = -0.717218
+        msg = ros.Message()
+        msg.name, msg.position = list(CONTROL_JOINT_NAMES), joints.tolist()
+        msg.header.stamp = node.get_clock().now().to_msg()
+        node._on_joints(msg)
+        snapshot = tuple(
+            TimedValue(node.now_ns, None, clock) for _ in range(3)
+        )
+        monkeypatch.setattr(
+            node.observations,
+            "synchronized",
+            lambda: snapshot + (np.eye(4), np.eye(4)),
+        )
+        monkeypatch.setattr(
+            client, "_build_request", lambda *args: ({}, {}, 1)
+        )
+        actions = np.tile(np.r_[joints[:7], 0, joints[7:14], 0], (12, 1))
+        actions[:7, 3] -= 0.440730
+        actions[7:, 3] = -1.337241
+        monkeypatch.setattr(
+            node, "_request_inference", lambda *args: (actions, latency)
+        )
+        node._inference_tick()
+        node._future.result(timeout=1)
+        node._control_tick()
+        assert all(not pub.messages for pub in node.publishers.values())
+        clock += latency
+        node.now_ns += round(latency * 1e9)
+        msg.header.stamp = node.get_clock().now().to_msg()
+        node._on_joints(msg)
+        node._inference_tick()
+        node._control_tick()
+        assert node.fault is None
+        if accepted:
+            # Seven elapsed intervals shorten the tail. Point zero is first.
+            np.testing.assert_array_equal(node._native_actions, actions[:5])
+            output = node.publishers[node.config.joint_command_topic].messages
+            step = node.config.max_arm_velocity_rad_s / node.config.control_hz
+            assert output[0].position[3] == pytest.approx(joints[3] - step)
+        else:
+            assert node._native_actions is node._control_actions is None
+            assert all(not pub.messages for pub in node.publishers.values())
+
+    def test_resume_jump_replans_from_fresh_frame_before_publishing(
+        self, config, ros, monkeypatch
+    ):
+        node = ros.create(
+            config(
+                enable_dagger=True,
+                control_token="x" * 16,
+                enable_control=True,
+                first_point_jump_rad=0.6,
+            )
+        )
+        send_state(node, ros, "HOLD")
+        node.now_ns += 1
+        send_state(node, ros, "AUTO", 2)
+        joints = np.array(client.DEFAULT_JOINT_POSITIONS)
+        joints[3] = -0.717218
+        msg = ros.Message()
+        msg.header.stamp = node.get_clock().now().to_msg()
+        msg.name, msg.position = list(CONTROL_JOINT_NAMES), joints.tolist()
+        node._on_joints(msg)
+        safe = np.tile(np.r_[joints[:7], 0, joints[7:14], 0], (12, 1))
+        rejected = safe.copy()
+        rejected[:7, 3] -= 0.440730
+        rejected[7:, 3] = -1.337241
+        # A replan may fail even after earlier chunks in this grant executed.
+        node._received_action_chunk = True
+        node._control_actions = node._native_actions = safe.copy()
+        node._latency_ewma = 0.245
+        node._future_window = node._control_window
+        node._future = Future()
+        node._future.set_result((rejected, 0.24498))
+        clock = time.monotonic()
+        monkeypatch.setattr(client.time, "monotonic", lambda: clock)
+        before_rejection = clock
+        node._inference_tick()
+        node._control_tick()
+        assert node.fault is None and node._jump_rejections == 1
+        assert node._native_actions is node._control_actions is None
+        assert all(not pub.messages for pub in node.publishers.values())
+
+        built = []
+        monkeypatch.setattr(
+            client,
+            "_build_request",
+            lambda *args: built.append(args) or ({}, {}, 1),
+        )
+        monkeypatch.setattr(
+            node, "_request_inference", lambda *args: (safe, 0.01)
+        )
+        # A sensor may stamp a queued image slightly ahead of the ROS clock.
+        stamp = node.now_ns + 1
+        received = before_rejection
+        monkeypatch.setattr(
+            node.observations,
+            "synchronized",
+            lambda: (
+                tuple(TimedValue(stamp, None, received) for _ in range(3))
+                + (np.eye(4), np.eye(4))
+            ),
+        )
+        node._inference_tick()
+        assert not built
+        clock += 0.01
+        received = clock
+        stamp = node.now_ns
+        node._inference_tick()
+        assert not built
+        stamp += 1
+        node._inference_tick()
+        node._future.result(timeout=1)
+        assert built[0][-2:] == (None, 0)
+        node._inference_tick()
+        node._control_tick()
+        assert node.fault is None and node._jump_rejections == 0
+        assert node.publishers[node.config.joint_command_topic].messages
+
+    def test_repeated_jumps_wait_for_a_new_hc_grant(self, config, ros):
+        node = ros.create(
+            config(
+                enable_dagger=True, control_token="x" * 16, enable_control=True
+            )
+        )
+        send_state(node, ros)
+        feedback(node, ros)
+        q = np.array(client.DEFAULT_JOINT_POSITIONS)
+        safe = np.tile(np.r_[q[:7], 0, q[7:14], 0], (12, 1))
+        rejected = safe.copy()
+        rejected[:, 3] += 1
+        for _ in range(3):
+            node._future_window = node._control_window
+            node._future_observed_s = time.monotonic()
+            node._future = Future()
+            node._future.set_result((rejected, 0.01))
+            node._inference_tick()
+        node._gate.invalidate("inference_unavailable")
+        node.now_ns += 1
+        send_state(node, ros)  # New transport window, same HC grant.
+        node._inference_tick()
+        node._control_tick()
+        assert node._inference_wait == "awaiting_new_auto_grant_after_jump"
+        assert node.fault is None and node._future is None
+        assert all(not pub.messages for pub in node.publishers.values())
+
+        node.now_ns += 1
+        send_state(node, ros, "HOLD", 2)
+        node.now_ns += 1
+        send_state(node, ros, "AUTO", 3)
+        node._future_window = node._control_window
+        node._future_observed_s = time.monotonic()
+        node._future = Future()
+        node._future.set_result((safe, 0.01))
+        node._inference_tick()
+        node._control_tick()
+        assert node.fault is None and node._jump_rejections == 0
+        assert node.publishers[node.config.joint_command_topic].messages
+
+    @pytest.mark.parametrize(
+        "dagger_enabled,target,reason",
+        [
+            (False, 1.0, "first action jumps"),
+            (True, np.nan, "must be finite"),
+        ],
+    )
+    def test_other_faults_still_latch(
+        self, config, ros, dagger_enabled, target, reason
+    ):
+        node = ros.create(
+            config(
+                enable_dagger=True, control_token="x" * 16, enable_control=True
+            )
+        )
+        send_state(node, ros, dagger_enabled=dagger_enabled)
+        feedback(node, ros)
+        q = np.array(client.DEFAULT_JOINT_POSITIONS)
+        chunk = np.tile(np.r_[q[:7], 0, q[7:14], 0], (12, 1))
+        chunk[:, 3] += target
+        node._future_window = node._control_window
+        node._future_observed_s = time.monotonic()
+        node._future = Future()
+        node._future.set_result((chunk, 0.01))
+        node._inference_tick()
+        assert reason in node.fault
+        assert not node._received_action_chunk
+        assert all(not pub.messages for pub in node.publishers.values())
+
     def test_pause_clears_both_blocks_and_no_fault_or_reset(self, config, ros):
         node = ros.create(
             config(

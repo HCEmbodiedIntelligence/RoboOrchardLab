@@ -99,6 +99,7 @@ DEFAULT_JOINT_POSITIONS = (
     0.15834697039601572,
 )
 _RESET_POSITION_TOLERANCE_RAD = 0.02
+_MAX_CONSECUTIVE_DAGGER_JUMPS = 3
 
 
 class RobotInterface(str, Enum):
@@ -170,8 +171,8 @@ class HcTjAsyncClientConfig:
             raise ValueError(
                 "depth_units_per_meter must be explicitly positive"
             )
-        if not 0 < self.inference_hz <= 6.0:
-            raise ValueError("inference_hz must be in (0, 2]")
+        if not 0 < self.inference_hz <= 30.0:
+            raise ValueError("inference_hz must be in (0, 30]")
         if (
             not math.isfinite(self.control_hz)
             or self.control_hz <= 0
@@ -488,11 +489,13 @@ def _ros_node_class():
             self._future: Future | None = None
             self._future_window = ""
             self._future_started = 0.0
-            self._discard_worker = ThreadPoolExecutor(max_workers=1)
-            self._discard_future: Future | None = None
+            self._future_observed_s = -math.inf
             self._gate = RobotControlGate()
             self._control_window = self._gate.snapshot()["window_id"]
             self._resume_stamp_ns = 0
+            self._replan_cutoff_s = -math.inf
+            self._auto_grant: tuple[str, str, int] | None = None
+            self._jump_rejections = 0
             self._relay = None
             self._motion: MotionInterface | None = None
             self._motion_publishers = {}
@@ -834,22 +837,71 @@ def _ros_node_class():
                 self._gate.invalidate("invalid ownership state")
             self._sync_control()
 
+        def _clear_trajectory(self) -> None:
+            """Drop queued output and RTC history under the action lock."""
+            self._native_actions = self._control_actions = None
+            self._native_started = 0.0
+            self._control_index = 0
+            self._received_action_chunk = False
+            self._latency_ewma = None
+            self._resume_stamp_ns = self.get_clock().now().nanoseconds
+
         def _sync_control(self) -> dict[str, Any]:
-            state = self._gate.snapshot()
-            if state["window_id"] != self._control_window:
+            with self._gate.lock:
+                state = self._gate.snapshot()
+                if state["window_id"] == self._control_window:
+                    return state
                 self._diagnostic_counts["authority_changes"] += 1
                 self._authority_events.append(state)
                 with self._lock:
-                    self._native_actions = self._control_actions = None
-                    self._native_started = 0.0
-                    self._control_index = 0
-                    self._received_action_chunk = False
-                    self._latency_ewma = None
+                    self._clear_trajectory()
+                    self._replan_cutoff_s = -math.inf
                     self._last_request = -math.inf
                     self._last_observation_timestamp_ns = None
                     self._control_window = state["window_id"]
-                    self._resume_stamp_ns = self.get_clock().now().nanoseconds
+                    if state["allowed"]:
+                        owner = state["ownership"]
+                        grant = (
+                            owner["controller_instance_id"],
+                            owner["session_id"],
+                            owner["epoch"],
+                        )
+                        if grant != self._auto_grant:
+                            self._auto_grant = grant
+                            self._jump_rejections = 0
             return state
+
+        def _reject_action_jump(
+            self, window: str, error: ActionDiscontinuityError
+        ) -> None:
+            with self._gate.lock:
+                if self.config.enable_dagger:
+                    state = self._gate.snapshot()
+                    if not self._gate.allows(window) or not self._relay.ready(
+                        window
+                    ):
+                        return
+                    if state["ownership"]["dagger_enabled"]:
+                        with self._lock:
+                            self._clear_trajectory()
+                            self._replan_cutoff_s = time.monotonic()
+                            self._jump_rejections += 1
+                            self._diagnostic_counts[
+                                "jump_chunks_rejected"
+                            ] += 1
+                        outcome = (
+                            "waiting for a new HC AUTO grant"
+                            if self._jump_rejections
+                            >= _MAX_CONSECUTIVE_DAGGER_JUMPS
+                            else "replanning from fresh observations"
+                        )
+                        self.get_logger().warning(
+                            f"Rejected DAgger chunk ({self._jump_rejections}/"
+                            f"{_MAX_CONSECUTIVE_DAGGER_JUMPS}), "
+                            f"{outcome}: {error}"
+                        )
+                        return
+                self._latch_fault(f"inference/protocol failure: {error}")
 
         def _hands_ready(self) -> bool:
             # Legacy hands keep the v1 open-loop contract in DAgger too.
@@ -893,6 +945,23 @@ def _ros_node_class():
                 remaining = trim_elapsed_actions(self._native_actions, elapsed)
                 return remaining.copy() if len(remaining) else None
 
+        def _execution_chunk(
+            self, actions: np.ndarray, elapsed: float, starting: bool
+        ) -> tuple[np.ndarray, int]:
+            if starting:
+                # No previous trajectory was running. Start this prediction
+                # at point zero, but keep only its unexpired duration.
+                age = max(elapsed, time.monotonic() - self._future_observed_s)
+                if age >= self.config.camera_timeout_s:
+                    return actions[:0], 0
+                steps = len(trim_elapsed_actions(actions, age))
+                return actions[:steps], 0
+            remaining = trim_elapsed_actions(actions, elapsed)
+            if len(remaining) == 0:
+                self._diagnostic_counts["chunk_fully_elapsed"] += 1
+                remaining = actions[-1:]
+            return remaining, len(actions) - len(remaining)
+
         def _check_feedback_freshness(self, sample: TimedValue) -> None:
             """Reject stalled delivery and queued old control feedback."""
             if _state_is_stale(
@@ -920,26 +989,16 @@ def _ros_node_class():
             allowed = state is None or (
                 state["allowed"] and self._relay.ready(window)
             )
+            if (
+                allowed
+                and self._jump_rejections >= _MAX_CONSECUTIVE_DAGGER_JUMPS
+            ):
+                self._inference_wait = "awaiting_new_auto_grant_after_jump"
+                return
             with self._lock:
                 if not self._reset_complete:
                     return
             now = time.monotonic()
-            if (
-                self._discard_future is not None
-                and self._discard_future.done()
-            ):
-                try:
-                    _, elapsed = self._discard_future.result()
-                    self._diagnostic_counts["completed"] += 1
-                    self._diagnostic_counts[
-                        "observation_completed_no_authority"
-                    ] += 1
-                    self._request_elapsed_ms = elapsed * 1000
-                except Exception as error:
-                    self.get_logger().warning(
-                        f"Suppressed observation request failed: {error}"
-                    )
-                self._discard_future = None
             if self._future is not None and self._future.done():
                 future, self._future = self._future, None
                 future_window = self._future_window
@@ -956,10 +1015,20 @@ def _ros_node_class():
                             and self._relay.ready(future_window)
                         )
                     ):
-                        remaining = trim_elapsed_actions(actions, elapsed)
+                        starting = (
+                            state is not None
+                            and state["ownership"]["dagger_enabled"]
+                            and not self._received_action_chunk
+                        )
+                        remaining, response_index = self._execution_chunk(
+                            actions, elapsed, starting
+                        )
                         if len(remaining) == 0:
-                            self._diagnostic_counts["chunk_fully_elapsed"] += 1
-                            remaining = actions[-1:]
+                            self._diagnostic_counts[
+                                "expired_start_chunks"
+                            ] += 1
+                            self._inference_wait = "expired_start_prediction"
+                            return
                         feedback_sample = self.observations.latest_joints()
                         self._check_feedback_freshness(feedback_sample)
                         feedback = feedback_sample.value[:14]
@@ -979,7 +1048,7 @@ def _ros_node_class():
                             )
                             raise ActionDiscontinuityError(
                                 f"{error}; response_index="
-                                f"{len(actions) - len(remaining)} "
+                                f"{response_index} "
                                 f"raw_first_max_delta_rad={raw_jump:.6f} "
                                 f"request_ms={elapsed * 1000:.2f}"
                             ) from error
@@ -1010,7 +1079,11 @@ def _ros_node_class():
                             self.limiter.reset(feedback)
                             self._diagnostic_counts["limiter_resets"] += 1
                             self._received_action_chunk = True
+                            self._jump_rejections = 0
                             self._diagnostic_counts["chunks_accepted"] += 1
+                except ActionDiscontinuityError as error:
+                    self._reject_action_jump(future_window, error)
+                    return
                 except Exception as error:
                     if state is None or self._gate.allows(future_window):
                         if self.config.enable_dagger and isinstance(
@@ -1031,9 +1104,6 @@ def _ros_node_class():
             if self._future is not None and allowed:
                 self._inference_wait = "inference_inflight"
                 return
-            if not allowed and self._discard_future is not None:
-                self._inference_wait = "observation_inflight_no_authority"
-                return
             if now - self._last_request < 1.0 / self.config.inference_hz:
                 self._inference_wait = "configured_request_period"
                 return
@@ -1043,9 +1113,10 @@ def _ros_node_class():
                 self._inference_wait = "observation_sync: " + str(error)
                 return
             if allowed and self.config.enable_dagger:
+                cutoff = max(self._gate.resume_started, self._replan_cutoff_s)
                 if any(
                     item.timestamp_ns <= self._resume_stamp_ns
-                    or item.received_monotonic_s <= self._gate.resume_started
+                    or item.received_monotonic_s <= cutoff
                     for item in snapshot[:3]
                 ):
                     self._inference_wait = "fresh_observation_after_authority"
@@ -1108,19 +1179,15 @@ def _ros_node_class():
             self._last_request = now
             self._last_observation_timestamp_ns = snapshot[0].timestamp_ns
             self._diagnostic_counts["requests"] += 1
-            if not allowed:
-                self._diagnostic_counts[
-                    "observation_requests_no_authority"
-                ] += 1
-                self._discard_future = self._discard_worker.submit(
-                    self._request_inference, files, form
-                )
-            else:
-                self._future_started = now
-                self._future_window = window
-                self._future = self._worker.submit(
-                    self._request_inference, files, form
-                )
+
+            self._future_started = now
+            self._future_observed_s = min(
+                item.received_monotonic_s for item in snapshot[:3]
+            )
+            self._future_window = window
+            self._future = self._worker.submit(
+                self._request_inference, files, form
+            )
 
         def _request_inference(
             self,
@@ -1302,7 +1369,6 @@ def _ros_node_class():
             """Stop the HTTP worker before releasing ROS resources."""
             if self._relay is not None:
                 self._relay.close()
-            self._discard_worker.shutdown(wait=False, cancel_futures=True)
             self._worker.shutdown(wait=False, cancel_futures=True)
             return super().destroy_node()
 
