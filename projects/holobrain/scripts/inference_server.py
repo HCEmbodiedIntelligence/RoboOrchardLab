@@ -18,6 +18,8 @@
 import argparse
 import json
 import logging
+import os
+import secrets
 import sys
 import time
 from io import BytesIO
@@ -41,6 +43,12 @@ from robo_orchard_core.utils.cli import (  # noqa: E402
     pydantic_from_argparse,
 )
 from robo_orchard_core.utils.logging import LoggerManager  # noqa: E402
+from robo_orchard_lab.models.holobrain.pipeline import (  # noqa: E402
+    HoloBrainInferencePipeline,
+)
+from robo_orchard_lab.models.holobrain.processor import (  # noqa: E402
+    MultiArmManipulationInput,
+)
 
 from projects.holobrain.scripts.hc_tj_async_core import (  # noqa: E402
     ACTION_HORIZON,
@@ -49,11 +57,10 @@ from projects.holobrain.scripts.hc_tj_async_core import (  # noqa: E402
     ProtocolError,
     validate_inference_request,
 )
-from robo_orchard_lab.models.holobrain.pipeline import (  # noqa: E402
-    HoloBrainInferencePipeline,
-)
-from robo_orchard_lab.models.holobrain.processor import (  # noqa: E402
-    MultiArmManipulationInput,
+from projects.holobrain.scripts.hc_tj_control import (  # noqa: E402
+    ControlledInference,
+    ServiceControlGate,
+    make_control_server,
 )
 
 logger = LoggerManager().get_child(__name__)
@@ -81,6 +88,10 @@ class Config(SettingConfig):
     """The number of valid action steps."""
     input_profile: str = TRI_CAMERA_PROFILE
     """Request schema: ``tri_camera_dual_arm`` or hc_tj-specific ``hc_tj``."""
+    require_control: bool = False
+    """Fence actions with ownership; use authenticated v2 inference only."""
+    control_token: str = ""
+    """Control bearer token; defaults to HC_TJ_GATEWAY_TOKEN environment."""
 
 
 parser = argparse.ArgumentParser(description=Config.__doc__)
@@ -91,6 +102,13 @@ except SystemExit as e:
     if e.code == 2:
         parser.print_help()
     exit(0)
+
+_require_control = getattr(args, "require_control", False)
+_control_token = getattr(args, "control_token", "") or os.environ.get(
+    "HC_TJ_GATEWAY_TOKEN", ""
+)
+if _require_control and len(_control_token) < 16:
+    raise ValueError("controlled inference requires a token of 16+ characters")
 
 pipeline = HoloBrainInferencePipeline.load_pipeline(
     directory=args.model_dir,
@@ -104,6 +122,11 @@ logger.info(f"Model server {args.server_name} started on port {args.port}")
 
 app = Flask(__name__)
 _pipeline_lock = Lock()
+_control_gate = ServiceControlGate()
+_controlled_inference = ControlledInference(_control_gate)
+if _require_control:
+    # Bound authenticated model uploads before decoding their contents.
+    app.config["MAX_CONTENT_LENGTH"] = 32_000_000
 
 
 def _load_npy(request_data: dict[str, Any], name: str, dtype) -> np.ndarray:
@@ -203,7 +226,9 @@ def _pipeline_has_rtc() -> bool:
 
 def _infer_hc_tj_async(request_data: dict[str, Any]) -> dict[str, Any]:
     """Run one serialized v1 inference and return native 30 Hz actions."""
+    request_started = time.perf_counter()
     model_input = _decode_hc_tj_async_request(request_data)
+    decode_ms = (time.perf_counter() - request_started) * 1000
     if model_input.remaining_actions is not None and not _pipeline_has_rtc():
         raise ProtocolError(
             "remaining_actions requires the loaded model to configure "
@@ -230,6 +255,8 @@ def _infer_hc_tj_async(request_data: dict[str, Any]) -> dict[str, Any]:
     start_time = time.perf_counter()
     explanation = None
     with _pipeline_lock:
+        pipeline_started = time.perf_counter()
+        lock_wait_ms = (pipeline_started - start_time) * 1000
         if grad_cam == "true":
             from projects.holobrain.scripts.hc_tj_grad_cam import (
                 infer_with_grad_cam,
@@ -243,6 +270,19 @@ def _infer_hc_tj_async(request_data: dict[str, Any]) -> dict[str, Any]:
                 output = pipeline(model_input)
     inference_ms = (time.perf_counter() - start_time) * 1000
     actions = torch.as_tensor(output.action).detach().cpu().numpy()
+    total_ms = (time.perf_counter() - request_started) * 1000
+    logger.info(
+        "[inference-diag] decode_ms=%.2f lock_wait_ms=%.2f "
+        "pipeline_and_copy_ms=%.2f total_ms=%.2f capacity_hz=%.3f "
+        "points=%d horizon_s=%.3f",
+        decode_ms,
+        lock_wait_ms,
+        (time.perf_counter() - pipeline_started) * 1000,
+        total_ms,
+        1000 / max(total_ms, 0.001),
+        len(actions),
+        len(actions) / ACTION_HZ,
+    )
     if (
         actions.ndim != 2
         or actions.shape[1] != len(HC_TJ_JOINT_NAMES)
@@ -432,6 +472,8 @@ def infer(request_data):
 
 @app.route(f"/{args.server_name}", methods=["POST"])
 def model_infer():
+    if _require_control:
+        return jsonify({"error": "controlled inference requires v2"}), 409
     try:
         data = {**request.files, **request.form}
 
@@ -475,6 +517,8 @@ def model_infer():
 @app.route(f"/{args.server_name}/hc_tj_async/v1", methods=["POST"])
 def hc_tj_async_model_infer():
     """Serve the strict HC-TJ 30 Hz, 16-axis asynchronous protocol."""
+    if _require_control:
+        return jsonify({"error": "controlled inference requires v2"}), 409
     try:
         data = {**request.files, **request.form}
         return jsonify(_infer_hc_tj_async(data))
@@ -486,11 +530,72 @@ def hc_tj_async_model_infer():
         return jsonify({"error": str(error), "error_type": "inference"}), 500
 
 
+@app.route(f"/{args.server_name}/hc_tj_control/v1", methods=["GET", "POST"])
+def hc_tj_control_update():
+    """Apply control or read counters without waiting for the model."""
+    if not _require_control:
+        return jsonify({"error": "controlled inference is not enabled"}), 409
+    if not secrets.compare_digest(
+        request.headers.get("Authorization", ""), f"Bearer {_control_token}"
+    ):
+        return jsonify({"error": "unauthorized"}), 401
+    if getattr(request, "method", "POST") == "GET":
+        with _control_gate.lock:
+            return jsonify(
+                {
+                    "server_instance": _control_gate.server_instance,
+                    "inference_submitted": _controlled_inference.submitted,
+                    "inference_dropped": _controlled_inference.dropped,
+                }
+            )
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "control heartbeat must be an object"}), 400
+    try:
+        return jsonify(_control_gate.update(data))
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 409
+
+
+@app.route(f"/{args.server_name}/hc_tj_async/v2", methods=["POST"])
+def hc_tj_controlled_model_infer():
+    """Compute continuously; mark whether this result may execute."""
+    if not _require_control:
+        return jsonify({"error": "controlled inference is not enabled"}), 409
+    if not secrets.compare_digest(
+        request.headers.get("Authorization", ""), f"Bearer {_control_token}"
+    ):
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        # Authentication protects model access. Ownership gates only execution
+        # of the result, so OFF/HOLD/MANUAL still perform model inference.
+        data = {**request.files, **request.form}
+        window = str(data.get("control_window", ""))
+        server = str(data.get("control_server", ""))
+        result = _controlled_inference.run(
+            window, server, lambda: _infer_hc_tj_async(data)
+        )
+        return jsonify(result)
+    except ProtocolError as error:
+        return jsonify({"error": str(error), "error_type": "protocol"}), 400
+    except Exception as error:
+        logger.exception("Controlled HC-TJ inference failed")
+        return jsonify({"error": str(error), "error_type": "inference"}), 500
+
+
 if __name__ == "__main__":
-    http_server = WSGIServer(("", args.port), app)
+    if _require_control:
+        # A native request thread owns the single model slot. Control requests
+        # use separate threads; no gevent loop waits on a native model lock.
+        http_server = make_control_server("", args.port, app)
+    else:
+        http_server = WSGIServer(("", args.port), app)
     try:
         http_server.serve_forever()
     except KeyboardInterrupt:
         logger.info("Model server %s stopped", args.server_name)
     finally:
-        http_server.stop()
+        if _require_control:
+            http_server.server_close()
+        else:
+            http_server.stop()

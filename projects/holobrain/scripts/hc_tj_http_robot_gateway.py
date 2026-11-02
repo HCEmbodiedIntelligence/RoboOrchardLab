@@ -44,16 +44,21 @@ sys.path.insert(0, str(_REPOSITORY_ROOT))
 from projects.holobrain.scripts.hc_tj_async_core import (  # noqa: E402
     ARM_JOINT_NAMES,
     CONTROL_JOINT_NAMES,
+    ActionDiscontinuityError,
     ArmCommandLimiter,
     ProtocolError,
     arm_actions,
     hand_command,
     interpolate_actions,
     load_arm_joint_limits,
+    measured_hand_closures,
     validate_action_chunk,
 )
+from projects.holobrain.scripts.hc_tj_control import RobotControlGate  # noqa: E402
 from projects.holobrain.scripts.hc_tj_http_protocol import (  # noqa: E402
     ACTION_PATH,
+    ACTION_V2_PATH,
+    CONTROL_PATH,
     HEALTH_PATH,
     JOINT_FEEDBACK_CONTENT_TYPE,
     JOINT_FEEDBACK_PATH,
@@ -83,6 +88,11 @@ class GatewayConfig:
     port: int = 8765
     enable_control: bool = False
     enable_hands: bool = False
+    enable_dagger: bool = False
+    robot_interface: str = "legacy"
+    motion_identity_mapping: bool = False
+    ownership_topic: str = "/status/control/ownership"
+    hand_state_topic: str = "/observation/hands/joint_states"
     urdf_path: Path | None = None
     control_hz: float = 100.0
     state_timeout_s: float = 0.25
@@ -93,12 +103,43 @@ class GatewayConfig:
     depth_topic: str = "/hc_teleop/camera_head/depth/compressed"
     calibration_topic: str = "/io_teleop/camera_head/calibration"
     extrinsics_topic: str = "/io_teleop/camera_head/extrinsics"
+    extrinsics_durability: str = "transient_local"
     joint_state_topic: str = "/hc_teleop/joint_states"
     joint_command_topic: str = "/hc_teleop/joint_cmd"
     right_hand_topic: str = "/hc_teleop/joint_cmd_finger_right"
     left_hand_topic: str = "/hc_teleop/joint_cmd_finger_left"
 
     def __post_init__(self) -> None:
+        if self.extrinsics_durability not in ("transient_local", "volatile"):
+            raise ValueError("unsupported extrinsics durability")
+        if self.robot_interface not in ("legacy", "hc_motion"):
+            raise ValueError("unknown robot interface")
+        if (
+            self.enable_dagger
+            and self.enable_control
+            and self.robot_interface == "legacy"
+        ):
+            # HC owns the final hardware topics. DAgger must enter its gate.
+            expected = {
+                "joint_command_topic": "/hc_teleop/joint_cmd",
+                "right_hand_topic": "/hc_teleop/joint_cmd_finger_right",
+                "left_hand_topic": "/hc_teleop/joint_cmd_finger_left",
+            }
+            for field, topic in expected.items():
+                if field != "joint_command_topic" and not self.enable_hands:
+                    continue
+                if getattr(self, field) != topic:
+                    raise ValueError(
+                        f"DAgger legacy {field} must be {topic}; "
+                        "HC middleware owns the /action hardware outputs"
+                    )
+        if self.robot_interface == "hc_motion":
+            if not self.motion_identity_mapping:
+                raise ValueError("Motion requires verified identity mapping")
+            if self.enable_hands:
+                raise ValueError(
+                    "Motion hand output requires an HC hand adapter"
+                )
         if len(self.token) < 16:
             raise ValueError("token must contain at least 16 characters")
         if not 0 < self.port <= 65535:
@@ -256,6 +297,15 @@ class RobotObservationStore:
                 )
             return result
 
+    def watermarks(self) -> tuple[int, int, int]:
+        """Return per-stream stamps for a resume freshness barrier."""
+        with self._condition:
+            return (
+                self._colors[-1].timestamp_ns if self._colors else 0,
+                self._depths[-1].timestamp_ns if self._depths else 0,
+                self._joints[-1].timestamp_ns if self._joints else 0,
+            )
+
     def wait_for_snapshot(
         self, after_observation_id: int, timeout_s: float
     ) -> RobotObservationPacket | None:
@@ -367,12 +417,19 @@ class _GatewayRequestHandler(BaseHTTPRequestHandler):
                     "status": "ok" if self.gateway.fault is None else "fault",
                     "control_enabled": self.gateway.config.enable_control,
                     "hands_enabled": self.gateway.config.enable_hands,
+                    "dagger_enabled": self.gateway.config.enable_dagger,
+                    "robot_interface": self.gateway.config.robot_interface,
                     "control_state": self.gateway.control_state,
                     "fault": self.gateway.fault,
                     "last_stop_reason": self.gateway.last_stop_reason,
                     "observations": self.gateway.observations.status(),
                 },
             )
+            return
+        if parsed.path == CONTROL_PATH:
+            if not self._require_authorization():
+                return
+            self._send_json(HTTPStatus.OK, self.gateway.control_snapshot())
             return
         if parsed.path == JOINT_FEEDBACK_PATH:
             if not self._require_authorization():
@@ -416,7 +473,8 @@ class _GatewayRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
 
     def do_POST(self) -> None:  # noqa: N802
-        if urlparse(self.path).path != ACTION_PATH:
+        path = urlparse(self.path).path
+        if path not in (ACTION_PATH, ACTION_V2_PATH, CONTROL_PATH):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             return
         if not self._require_authorization():
@@ -425,11 +483,22 @@ class _GatewayRequestHandler(BaseHTTPRequestHandler):
             content_length = int(self.headers.get("Content-Length", "-1"))
             if not 0 < content_length <= 1_000_000:
                 raise ProtocolError("invalid action Content-Length")
-            sequence_id, actions = decode_action_chunk(
-                self.rfile.read(content_length)
-            )
+            payload = self.rfile.read(content_length)
+            if path == CONTROL_PATH:
+                data = json.loads(payload)
+                if data.get("invalidate") is not True:
+                    raise ProtocolError("control only permits invalidation")
+                self.gateway.invalidate_control(
+                    "control relay resynchronizing"
+                )
+                self._send_json(HTTPStatus.OK, self.gateway.control_snapshot())
+                return
+            if self.gateway.config.enable_dagger and path != ACTION_V2_PATH:
+                raise PermissionError("DAgger requires controlled action v2")
+            sequence_id, actions = decode_action_chunk(payload)
+            window = json.loads(payload).get("control_window")
             accepted_steps = self.gateway.accept_action_chunk(
-                sequence_id, actions
+                sequence_id, actions, control_window=window
             )
             self._send_json(
                 HTTPStatus.OK,
@@ -441,6 +510,15 @@ class _GatewayRequestHandler(BaseHTTPRequestHandler):
             )
         except PermissionError as error:
             self._send_json(HTTPStatus.FORBIDDEN, {"error": str(error)})
+        except ActionDiscontinuityError as error:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "error": str(error),
+                    "error_type": "action_discontinuity",
+                    "recoverable": True,
+                },
+            )
         except (ProtocolError, TypeError, ValueError) as error:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
         except _ActionStreamPausedError as error:
@@ -597,7 +675,17 @@ def _ros_node_class():
             super().__init__("holobrain_hc_tj_http_robot_gateway")
             self.config = config
             self.observations = RobotObservationStore()
-            self._action_lock = threading.Lock()
+            self._gate = RobotControlGate()
+            self._action_lock = self._gate.lock
+            self._control_window = ""
+            self._scheduled_window = ""
+            self._observation_floor = (0, 0, 0)
+            self._resume_stamp_ns = 0
+            self._hand_closures = None
+            self._hand_received = -float("inf")
+            self._hand_stamp_ns = 0
+            self._motion = None
+            self._motion_publishers = {}
             self._action_stream = _ActionStreamSchedule()
             self._fault: str | None = None
             self._next_publisher_check = 0.0
@@ -636,11 +724,38 @@ def _ros_node_class():
             )
             self.create_subscription(
                 JointState,
-                config.joint_state_topic,
+                (
+                    "/observation/joint_states"
+                    if config.robot_interface == "hc_motion"
+                    else config.joint_state_topic
+                ),
                 self._on_joints,
                 reliable,
                 callback_group=self._state_callback_group,
             )
+            if config.enable_dagger:
+                self.create_subscription(
+                    String,
+                    config.ownership_topic,
+                    self._on_ownership,
+                    latched,
+                    callback_group=self._control_callback_group,
+                )
+                self.create_subscription(
+                    JointState,
+                    config.hand_state_topic,
+                    self._on_hands,
+                    best_effort,
+                    callback_group=self._state_callback_group,
+                )
+            if config.robot_interface == "hc_motion":
+                self.create_subscription(
+                    String,
+                    "/status/robot/info",
+                    self._on_robot_info,
+                    latched,
+                    callback_group=self._state_callback_group,
+                )
             self.create_subscription(
                 String,
                 config.calibration_topic,
@@ -652,7 +767,11 @@ def _ros_node_class():
                 String,
                 config.extrinsics_topic,
                 self._on_extrinsics,
-                latched,
+                # HC streams current extrinsics with volatile durability;
+                # standalone drivers can retain late-join latched metadata.
+                reliable
+                if config.extrinsics_durability == "volatile"
+                else latched,
                 callback_group=self._camera_callback_group,
             )
 
@@ -667,9 +786,10 @@ def _ros_node_class():
                     upper,
                     config.max_arm_velocity_rad_s,
                 )
-                self._joint_publisher = self.create_publisher(
-                    JointState, config.joint_command_topic, reliable
-                )
+                if config.robot_interface == "legacy":
+                    self._joint_publisher = self.create_publisher(
+                        JointState, config.joint_command_topic, reliable
+                    )
                 if config.enable_hands:
                     self._right_hand_publisher = self.create_publisher(
                         JointState, config.right_hand_topic, best_effort
@@ -686,6 +806,97 @@ def _ros_node_class():
                 self.get_logger().warning(
                     "dry-run gateway: no ROS control publishers were created"
                 )
+
+        def _sync_control(self) -> dict[str, Any]:
+            state = self._gate.snapshot()
+            if (
+                self.config.enable_dagger
+                and state["window_id"] != self._control_window
+            ):
+                self._control_window = state["window_id"]
+                self._action_stream = _ActionStreamSchedule()
+                self._scheduled_window = ""
+                self._resume_stamp_ns = self.get_clock().now().nanoseconds
+                self._observation_floor = tuple(
+                    max(stamp, self._resume_stamp_ns)
+                    for stamp in self.observations.watermarks()
+                )
+            return state
+
+        def control_snapshot(self) -> dict[str, Any]:
+            """Return the leased execution window and resume watermarks."""
+            with self._action_lock:
+                state = self._sync_control()
+                state["observation_floor"] = self._observation_floor
+                state["hand_closures"] = self._hand_closures
+                state["hand_fresh"] = (
+                    time.monotonic() - self._hand_received
+                    < self.config.state_timeout_s
+                    and self._hand_received > self._gate.resume_started
+                    and self._hand_stamp_ns > self._resume_stamp_ns
+                )
+                return state
+
+        def invalidate_control(self, reason: str) -> None:
+            """Close a disconnected relay's window, preserving HC ownership."""
+            with self._action_lock:
+                self._gate.invalidate(reason)
+                self._sync_control()
+
+        def _on_ownership(self, message: Any) -> None:
+            try:
+                with self._action_lock:
+                    if self._fault is not None:
+                        return
+                    self._gate.update_ownership(
+                        json.loads(message.data),
+                        self.get_clock().now().nanoseconds,
+                    )
+                    self._sync_control()
+            except (ValueError, TypeError, KeyError) as error:
+                self.invalidate_control(f"invalid ownership: {error}")
+
+        def _on_hands(self, message: Any) -> None:
+            try:
+                stamp = _timestamp_ns(message)
+                if (
+                    not -0.05
+                    <= (self.get_clock().now().nanoseconds - stamp) / 1e9
+                    <= self.config.state_timeout_s
+                ):
+                    return
+                values = measured_hand_closures(message.name, message.position)
+                with self._action_lock:
+                    if stamp <= self._hand_stamp_ns:
+                        return
+                    self._hand_closures = values
+                    self._hand_stamp_ns = stamp
+                    self._hand_received = time.monotonic()
+            except (ValueError, TypeError):
+                with self._action_lock:
+                    self._hand_received = -float("inf")
+
+        def _on_robot_info(self, message: Any) -> None:
+            from projects.holobrain.scripts.hc_tj_motion import MotionInterface
+
+            try:
+                info = json.loads(message.data)
+                if self._motion is not None:
+                    if info != self._motion_info:
+                        self._latch_fault(
+                            "Motion robot info changed; restart required"
+                        )
+                    return
+                motion = MotionInterface.from_info(info, identity_mapping=True)
+                with self._action_lock:
+                    self._motion, self._motion_info = motion, info
+                    if self.config.enable_control:
+                        self._motion_publishers = {
+                            topic: self.create_publisher(JointState, topic, 1)
+                            for topic in motion.topics
+                        }
+            except (ValueError, TypeError, KeyError) as error:
+                self._latch_fault(f"invalid Motion capabilities: {error}")
 
         @property
         def fault(self) -> str | None:
@@ -710,6 +921,8 @@ def _ros_node_class():
                 if self._fault is None:
                     self._fault = reason
                     self._action_stream.stop(reason)
+                    if self.config.enable_dagger:
+                        self._gate.invalidate(reason)
                     newly_latched = True
             if newly_latched:
                 self.get_logger().error(f"Latched control fault: {reason}")
@@ -732,10 +945,22 @@ def _ros_node_class():
 
         def _on_joints(self, message: Any) -> None:
             try:
+                if self.config.robot_interface == "hc_motion":
+                    if self._motion is None:
+                        return
+                    positions = self._motion.feedback(
+                        message.name, message.position
+                    )
+                    names = CONTROL_JOINT_NAMES
+                else:
+                    positions, names = (
+                        np.asarray(message.position),
+                        tuple(message.name),
+                    )
                 self.observations.add_joints(
                     _timestamp_ns(message),
-                    tuple(message.name),
-                    np.asarray(message.position),
+                    names,
+                    positions,
                 )
             except ValueError as error:
                 self._latch_fault(str(error))
@@ -753,7 +978,11 @@ def _ros_node_class():
                 self._latch_fault(str(error))
 
         def accept_action_chunk(
-            self, sequence_id: int, actions: np.ndarray
+            self,
+            sequence_id: int,
+            actions: np.ndarray,
+            *,
+            control_window: str | None = None,
         ) -> int:
             """Validate and atomically schedule one native 30 Hz chunk."""
             if not self.config.enable_control:
@@ -775,6 +1004,13 @@ def _ros_node_class():
                 actions, target_hz=int(self.config.control_hz)
             )
             with self._action_lock:
+                self._sync_control()
+                if self.config.enable_dagger and not self._gate.allows(
+                    control_window
+                ):
+                    raise _ActionStreamPausedError(
+                        "control window is closed or stale"
+                    )
                 if self._fault is not None:
                     raise RuntimeError(
                         f"gateway fault is latched: {self._fault}"
@@ -787,11 +1023,14 @@ def _ros_node_class():
                 # the limiter cannot jump backward to delayed joint feedback.
                 if starts_session:
                     self._limiter.reset(feedback.positions[:14])
+                self._scheduled_window = control_window
             return len(interpolated)
 
         def _competing_publishers(self) -> list[str]:
             conflicts = []
             topics = [self.config.joint_command_topic]
+            if self.config.robot_interface == "hc_motion":
+                topics = list(self._motion_publishers)
             if self.config.enable_hands:
                 topics.extend(
                     (self.config.right_hand_topic, self.config.left_hand_topic)
@@ -805,6 +1044,12 @@ def _ros_node_class():
             return conflicts
 
         def _control_tick(self) -> None:
+            with self._action_lock:
+                self._sync_control()
+                if self.config.enable_dagger and not self._gate.allows(
+                    self._scheduled_window
+                ):
+                    return
             if self.fault is not None:
                 return
             now = time.monotonic()
@@ -839,7 +1084,13 @@ def _ros_node_class():
                 ):
                     raise ValueError("joint feedback is stale")
                 with self._action_lock:
+                    self._sync_control()
+                    if self.config.enable_dagger and not self._gate.allows(
+                        self._scheduled_window
+                    ):
+                        return
                     action = self._action_stream.next_action()
+                    window = self._scheduled_window
                     if action is None:
                         return
                     arm = self._limiter.step(
@@ -853,18 +1104,41 @@ def _ros_node_class():
                 names, positions = _arm_joint_command(arm)
                 command.name = list(names)
                 command.position = list(positions)
-                self._joint_publisher.publish(command)
-                if self.config.enable_hands:
-                    for side, closure, publisher in (
-                        ("right", action[7], self._right_hand_publisher),
-                        ("left", action[15], self._left_hand_publisher),
+                with self._action_lock:
+                    if self.config.enable_dagger and not self._gate.allows(
+                        window
                     ):
-                        names, positions = hand_command(side, float(closure))
-                        hand = JointState()
-                        hand.header.stamp = command.header.stamp
-                        hand.name = list(names)
-                        hand.position = positions.tolist()
-                        publisher.publish(hand)
+                        return
+                    if self.config.robot_interface == "hc_motion":
+                        if self._motion is None:
+                            return
+                        for (
+                            topic,
+                            joint_names,
+                            values,
+                        ) in self._motion.commands(arm):
+                            target = JointState()
+                            target.header.stamp = command.header.stamp
+                            target.name, target.position = (
+                                list(joint_names),
+                                list(values),
+                            )
+                            self._motion_publishers[topic].publish(target)
+                    else:
+                        self._joint_publisher.publish(command)
+                    if self.config.enable_hands:
+                        for side, closure, publisher in (
+                            ("right", action[7], self._right_hand_publisher),
+                            ("left", action[15], self._left_hand_publisher),
+                        ):
+                            names, positions = hand_command(
+                                side, float(closure)
+                            )
+                            hand = JointState()
+                            hand.header.stamp = command.header.stamp
+                            hand.name = list(names)
+                            hand.position = positions.tolist()
+                            publisher.publish(hand)
             except (RuntimeError, ValueError) as error:
                 self._latch_fault(str(error))
 
@@ -882,6 +1156,23 @@ def _parse_args() -> GatewayConfig:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--enable-control", action="store_true")
     parser.add_argument("--enable-hands", action="store_true")
+    parser.add_argument("--enable-dagger", action="store_true")
+    parser.add_argument(
+        "--robot-interface", choices=("legacy", "hc_motion"), default="legacy"
+    )
+    parser.add_argument("--motion-identity-mapping", action="store_true")
+    parser.add_argument(
+        "--extrinsics-durability",
+        choices=("transient_local", "volatile"),
+        default="transient_local",
+        help="Use volatile for periodically published HC camera extrinsics",
+    )
+    parser.add_argument(
+        "--ownership-topic", default="/status/control/ownership"
+    )
+    parser.add_argument(
+        "--hand-state-topic", default="/observation/hands/joint_states"
+    )
     parser.add_argument("--urdf-path", type=Path)
     parser.add_argument("--control-hz", type=float, default=100.0)
     parser.add_argument("--state-timeout-s", type=float, default=0.25)

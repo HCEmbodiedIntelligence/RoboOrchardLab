@@ -55,7 +55,7 @@ from projects.holobrain.scripts.hc_tj_async_core import (
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
 URDF_PATH = (
-    REPOSITORY_ROOT / "hc_assets/hc_tj_description/urdf/hc_tj_robot.urdf"
+    REPOSITORY_ROOT / "projects/holobrain/assets/hc_tj_robot.urdf"
 )
 
 
@@ -341,6 +341,31 @@ class TestObservationAndConfiguration:
         with pytest.raises(ValueError, match="outside"):
             nearest_timed_value(values, 200, 20)
 
+    @pytest.mark.parametrize(
+        ("stream", "stamp", "tolerance", "delta"),
+        [
+            ("joints", 940_000_000, 20_000_000, "-60.000"),
+            ("depth", 1_070_000_000, 50_000_000, "+70.000"),
+        ],
+    )
+    def test_sync_error_identifies_stream_and_offset(
+        self, stream, stamp, tolerance, delta
+    ):
+        with pytest.raises(ValueError) as error:
+            nearest_timed_value(
+                [TimedValue(stamp, None)],
+                1_000_000_000,
+                tolerance,
+                stream_name=stream,
+            )
+        assert f"nearest {stream} is outside" in str(error.value)
+        assert f"delta_ms={delta}" in str(error.value)
+        assert f"tolerance_ms={tolerance / 1e6:.3f}" in str(error.value)
+        with pytest.raises(ValueError, match=f"empty {stream} stream"):
+            nearest_timed_value(
+                [], 1_000_000_000, tolerance, stream_name=stream
+            )
+
     def test_parses_calibration_and_zhi_to_eye_extrinsics(self):
         intrinsic = parse_camera_calibration(
             {
@@ -413,12 +438,18 @@ class TestObservationAndConfiguration:
         assert config.enable_control is False
         assert config.camera_timeout_s == 1.0
         assert config.color_topic == (
-            "/hc_teleop/camera_head/color/compressed"
+            "/observation/cameras/head/color/compressed"
         )
         assert config.depth_topic == (
-            "/hc_teleop/camera_head/depth/compressed"
+            "/observation/cameras/head/depth/compressed"
         )
-        assert config.joint_state_topic == "/hc_teleop/joint_states"
+        assert config.calibration_topic == (
+            "/observation/cameras/head/calibration"
+        )
+        assert config.extrinsics_topic == (
+            "/observation/cameras/head/extrinsics"
+        )
+        assert config.joint_state_topic == "/observation/joint_states"
         assert config.joint_command_topic == "/hc_teleop/joint_cmd"
         assert config.right_hand_topic == ("/hc_teleop/joint_cmd_finger_right")
         assert config.left_hand_topic == ("/hc_teleop/joint_cmd_finger_left")

@@ -30,6 +30,7 @@ import numpy as np
 __all__ = [
     "ACTION_HZ",
     "ACTION_HORIZON",
+    "ActionDiscontinuityError",
     "ARM_JOINT_NAMES",
     "ArmCommandLimiter",
     "CONTROL_JOINT_NAMES",
@@ -47,6 +48,7 @@ __all__ = [
     "hand_command",
     "interpolate_actions",
     "load_arm_joint_limits",
+    "measured_hand_closures",
     "nearest_timed_value",
     "parse_camera_calibration",
     "parse_robot_camera_extrinsics",
@@ -159,14 +161,23 @@ class ProtocolError(ValueError):
     """Report an invalid HC-TJ asynchronous request or response contract."""
 
 
+class ActionDiscontinuityError(ValueError):
+    """Reject a valid-shaped trajectory too far from current arm feedback.
+
+    Discard the rejected trajectory and its continuation before replanning
+    from fresh observations. This error never authorizes the rejected action.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class TimedValue:
     """Pair an observation's source time with its local receive time.
 
-    ``timestamp_ns`` belongs to the ROS publisher clock and is used only to
-    synchronize robot-originated streams. ``received_monotonic_s`` belongs to
-    the receiving process and is the safe clock for freshness checks across
-    hosts that may not have synchronized wall clocks.
+    ``timestamp_ns`` belongs to the ROS publisher clock and aligns
+    robot-originated streams. The control client also checks this timestamp
+    against its ROS clock to reject queued old feedback, so control requires
+    synchronized ROS clocks. ``received_monotonic_s`` belongs to the receiving
+    process and independently detects interruption of callback delivery.
     """
 
     timestamp_ns: int
@@ -407,6 +418,39 @@ def arm_actions(actions: np.ndarray) -> np.ndarray:
     return np.concatenate((values[..., :7], values[..., 8:15]), axis=-1)
 
 
+def measured_hand_closures(
+    names: Sequence[str], positions: Sequence[float]
+) -> tuple[float, float]:
+    """Project measured finger positions onto the right/left closure axes.
+
+    Both complete ten-joint hands are required. This is a least-squares
+    observation projection using the same open/closed calibration as output,
+    not feedback synthesized from the previous command.
+    """
+    if len(names) != len(positions) or len(set(names)) != len(names):
+        raise ValueError("invalid measured hand names or positions")
+    values = dict(zip(names, positions, strict=True))
+    closures = []
+    for joints, opened, closed in (
+        (RIGHT_HAND_JOINT_NAMES, RIGHT_HAND_OPEN, RIGHT_HAND_CLOSED),
+        (LEFT_HAND_JOINT_NAMES, LEFT_HAND_OPEN, LEFT_HAND_CLOSED),
+    ):
+        if not set(joints) <= values.keys():
+            raise ValueError("both measured hands are required")
+        measured = np.asarray([values[name] for name in joints], dtype=float)
+        if not np.all(np.isfinite(measured)):
+            raise ValueError("measured hands must be finite")
+        axis = closed - opened
+        closures.append(
+            float(
+                np.clip(
+                    np.dot(measured - opened, axis) / np.dot(axis, axis), 0, 1
+                )
+            )
+        )
+    return closures[0], closures[1]
+
+
 def hand_command(
     side: str, closure: float
 ) -> tuple[tuple[str, ...], np.ndarray]:
@@ -465,11 +509,16 @@ def validate_action_chunk(
         raise ValueError("feedback_arm must have shape [14]")
     if not np.all(np.isfinite(values)) or not np.all(np.isfinite(feedback)):
         raise ValueError("action chunk and feedback must be finite")
-    jump = float(np.max(np.abs(arm_actions(values[0]) - feedback)))
+    target = arm_actions(values[0])
+    deltas = np.abs(target - feedback)
+    axis = int(np.argmax(deltas))
+    jump = float(deltas[axis])
     if jump > first_point_jump_rad:
-        raise ValueError(
+        raise ActionDiscontinuityError(
             f"first action jumps {jump:.6f} rad from feedback; "
-            f"limit is {first_point_jump_rad:.6f} rad"
+            f"limit is {first_point_jump_rad:.6f} rad; "
+            f"joint={ARM_JOINT_NAMES[axis]} "
+            f"target_rad={target[axis]:.6f} feedback_rad={feedback[axis]:.6f}"
         )
 
 
@@ -481,6 +530,9 @@ class ArmCommandLimiter:
     upper: np.ndarray
     max_velocity_rad_s: float = 0.25
     previous: np.ndarray | None = None
+    position_clipped: int = 0
+    velocity_clipped: int = 0
+    max_clip_rad: float = 0.0
 
     def __post_init__(self) -> None:
         self.lower = np.asarray(self.lower, dtype=np.float64)
@@ -515,16 +567,30 @@ class ArmCommandLimiter:
         command = self.previous + np.clip(
             bounded - self.previous, -max_delta, max_delta
         )
+        self.position_clipped += int(np.any(np.abs(target - bounded) > 1e-9))
+        self.velocity_clipped += int(np.any(np.abs(bounded - command) > 1e-9))
+        self.max_clip_rad = max(
+            self.max_clip_rad, float(np.max(np.abs(target - command)))
+        )
         self.previous = command
         return command.copy()
 
 
 def nearest_timed_value(
-    values: Sequence[TimedValue], target_ns: int, tolerance_ns: int
+    values: Sequence[TimedValue],
+    target_ns: int,
+    tolerance_ns: int,
+    *,
+    stream_name: str = "observation",
 ) -> TimedValue:
-    """Return the nearest timestamped value, preferring the earlier on ties."""
+    """Return the nearest sample, preferring the earlier on ties.
+
+    ``stream_name`` labels synchronization errors. Out-of-tolerance errors
+    include the signed sample-minus-target offset and the permitted offset
+    in milliseconds; timestamp matching and tolerance enforcement are exact.
+    """
     if not values:
-        raise ValueError("cannot synchronize an empty observation stream")
+        raise ValueError(f"cannot synchronize an empty {stream_name} stream")
     selected = min(
         values,
         key=lambda item: (
@@ -534,7 +600,9 @@ def nearest_timed_value(
     )
     if abs(selected.timestamp_ns - target_ns) > tolerance_ns:
         raise ValueError(
-            "nearest observation is outside synchronization tolerance"
+            f"nearest {stream_name} is outside synchronization tolerance: "
+            f"delta_ms={(selected.timestamp_ns - target_ns) / 1e6:+.3f}, "
+            f"tolerance_ms={tolerance_ns / 1e6:.3f}"
         )
     return selected
 
