@@ -1,4 +1,6 @@
 hc_assets/
+runtime/
+projects/holobrain/assets
 own_test/
 workspace/
 projects/holobrain/own_test

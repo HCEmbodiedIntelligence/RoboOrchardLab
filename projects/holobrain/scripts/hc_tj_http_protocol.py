@@ -35,6 +35,8 @@ from projects.holobrain.scripts.hc_tj_async_core import (
 
 __all__ = [
     "ACTION_PATH",
+    "ACTION_V2_PATH",
+    "CONTROL_PATH",
     "HEALTH_PATH",
     "JOINT_FEEDBACK_CONTENT_TYPE",
     "JOINT_FEEDBACK_PATH",
@@ -55,6 +57,8 @@ PROTOCOL_VERSION = "hc_tj_http_gateway/v1"
 OBSERVATION_PATH = "/hc_tj/observation/v1"
 JOINT_FEEDBACK_PATH = "/hc_tj/joint_feedback/v1"
 ACTION_PATH = "/hc_tj/action_chunk/v1"
+CONTROL_PATH = "/hc_tj/control/v1"
+ACTION_V2_PATH = "/hc_tj/action_chunk/v2"
 HEALTH_PATH = "/healthz"
 OBSERVATION_CONTENT_TYPE = "application/vnd.hc-tj.observation-v1"
 JOINT_FEEDBACK_CONTENT_TYPE = "application/vnd.hc-tj.joint-feedback-v1"
@@ -239,7 +243,9 @@ def decode_observation(payload: bytes) -> RobotObservationPacket:
         raise ProtocolError("observation fields are invalid") from error
 
 
-def encode_action_chunk(sequence_id: int, actions: np.ndarray) -> bytes:
+def encode_action_chunk(
+    sequence_id: int, actions: np.ndarray, *, control_window: str | None = None
+) -> bytes:
     """Encode one native 30 Hz action chunk for robot-side execution."""
     values = np.asarray(actions)
     if sequence_id < 0:
@@ -252,16 +258,18 @@ def encode_action_chunk(sequence_id: int, actions: np.ndarray) -> bytes:
         or not np.all(np.isfinite(values))
     ):
         raise ProtocolError("actions must be finite float32 [1..64,16]")
-    return json.dumps(
-        {
-            "protocol_version": PROTOCOL_VERSION,
-            "sequence_id": sequence_id,
-            "joint_names": HC_TJ_JOINT_NAMES,
-            "action_hz": ACTION_HZ,
-            "actions": values.tolist(),
-        },
-        separators=(",", ":"),
-    ).encode("utf-8")
+    payload = {
+        "protocol_version": PROTOCOL_VERSION,
+        "sequence_id": sequence_id,
+        "joint_names": HC_TJ_JOINT_NAMES,
+        "action_hz": ACTION_HZ,
+        "actions": values.tolist(),
+    }
+    if control_window is not None:
+        if not isinstance(control_window, str) or not control_window:
+            raise ProtocolError("control_window must be a nonempty string")
+        payload["control_window"] = control_window
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
 def decode_action_chunk(payload: bytes) -> tuple[int, np.ndarray]:

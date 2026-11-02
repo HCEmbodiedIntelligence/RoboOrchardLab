@@ -12,7 +12,72 @@ HC_X1 驱动 ──本机 ROS──> hc_tj_http_robot_gateway.py
                               └──动作块 HTTP──> 网关 ──本机 ROS──> HC_X1
 ```
 
-## 推荐：两端一键启动
+## 推荐：独立推理与 DAgger 动作授权（v2）
+
+v1/v2 是通信和控制协议版本，使用同一个模型。v2 动作带有当前控制窗口标识，
+暂停、接管和重新授权后旧窗口的动作不能继续执行。模型推理与动作授权相互独立：
+只要机器人观测可用，OFF/HOLD/MANUAL 下也会持续推理，但结果不会下发。
+
+X1 的 HC-teleop-robotic 实机入口现在管理 DAgger 网关：先单独启动 HC_X1，
+然后在 HC-teleop-robotic 目录运行：
+
+```bash
+ROS_DOMAIN_ID=13 ./run.sh teleop
+```
+
+不再另外运行 `holobrain_http_gateway/start_robot.sh`。X1 legacy DAgger 配置下，
+实机入口自动使用 `~/holobrain_http_gateway` 的网关代码；安装在其他位置时设置
+`HC_TJ_GATEWAY_ROOT`。网关日志为本次 HC 会话的 `middleware/holobrain_gateway.log`。
+端口占用会在启动前报错，需人工停止旧网关。退出 HC 时自动停止其网关，外部
+HC_X1 仍由用户管理；普通 Dashboard 和仿真入口不会启动此网关。
+网关只向 `/hc_teleop` 输入发程序动作，由 HC 独占 `/action` 硬件输出；
+DAgger legacy 模式会拒绝绕过这一仲裁入口的命令话题配置。
+
+DAgger 网关从 `/observation/cameras/head/calibration` 接收标定，
+从 `/observation/cameras/head/extrinsics` 接收外参。标定采用
+reliable/transient-local，周期外参采用 reliable/volatile，以匹配 HC 的发布方式。
+普通 v1 默认仍使用旧元数据话题和 transient-local 外参；手动配置网关时可用
+`--extrinsics-durability volatile` 接收周期外参。图像和关节数据齐全但元数据缺失时，
+完整观测接口会返回 204，此时模型没有可用观测，不能仅凭启动提示判断已经在推理。
+
+两端 ROS 域应保持一致。网关需要完整的双臂和腰部状态；`waist:=false` 会关闭
+腰部反馈，保留状态但禁止腰部命令和回零应使用 `waist_control:=false`。
+
+GPU 主机启动脚本默认启用 DAgger v2：
+
+```bash
+./projects/holobrain/scripts/start_hc_tj_http_local.sh 'Pick up the object in front of the robot.'
+```
+
+在 HC Dashboard 的“DAgger 动作授权与人工接管”中点击“开启会话”，再点击
+“开始程序”授权动作下发。
+安全开关只控制动作下发，不控制模型计算；自动模式无需头显在线。VR 接管仍需要
+有效跟踪及新鲜的 Grip 释放/握持事件，人工控制时断线会停止输出。关闭、暂停、
+故障和急停都不允许模型动作；恢复只回到保持，需要再次明确开启程序控制。
+
+授权打开后只使用新观测生成的结果；未授权时开始计算的结果不会在之后自动变成
+可执行动作。硬件就绪、双臂反馈时效、动作限位限速及急停检查仍然有效。
+DAgger 客户端与网关默认均使用 0.3 rad 的首点偏差上限。首点超限时丢弃本次
+结果，清除旧轨迹并用新观测重新推理；只有当前 AUTO 授权仍然有效且新结果通过
+检查才会继续下发，不会放宽上限或自动解除 HC 的 FAULT。
+手部沿用普通 v1 的开合指令方式，不要求手位置反馈。模型的手部输入初始为 0，
+随后按正在执行的动作轨迹估计；该估计不是实测反馈。手部遥测仅用于诊断，缺失
+或过期不会阻止 AUTO。手部仍检查目标范围、命令时效和授权，已有同一控制窗口内
+的下发目标时保留限速；首个目标按原来的开环方式发送。
+
+使用 `start_hc_tj_ros_local.sh` 的 ROS 直连 legacy 客户端也遵守上述开环约定：
+启用 DAgger 不会额外要求手部位置反馈，手部输入按最后已发布的手指令估计。
+启动和人工接管后的恢复均不等待手反馈；RGB-D、双臂状态及控制窗口检查仍然有效。
+显式选择 `--robot-interface hc_motion` 的独立后端仍使用实测手部输入。
+
+脚本自动将网关主机及本机加入 `no_proxy`/`NO_PROXY`，同时覆盖 curl 和 Python
+请求。只有 HTTP 401 才会自动刷新已有 TOKEN；HTTP 503 表示关节反馈尚未就绪，
+应检查 ROS 域和关节话题，而不是重新输入 SSH 密码。
+
+## 普通 v1：独立硬件与网关一键启动
+
+以下为未使用 HC DAgger 仲裁器的 v1 部署方式，不适用于已经单独运行 HC_X1
+和 HC-teleop-robotic 的 v2 组合。
 
 首次运行时，机器人脚本会自动生成 Bearer token 并以 `600` 权限保存到
 `~/.config/holobrain/hc_tj_gateway_token`。GPU 主机脚本缺少本地 token 时，会通过
@@ -31,12 +96,11 @@ GPU 主机也只需运行一个脚本；它会加载模型、等待推理端口�
 影响控制首帧的时序和连续性检查：
 
 ```bash
-./projects/holobrain/scripts/start_hc_tj_http_local.sh \
+HC_TJ_ENABLE_DAGGER=0 ./projects/holobrain/scripts/start_hc_tj_http_local.sh \
   'Pick up the object in front of the robot.'
 ```
 
-一键脚本默认加载仓库中的 `260823_w/export/model`；需要使用其他导出模型时，
-可通过 `HC_TJ_MODEL_DIR` 覆盖。
+通过 `HC_TJ_MODEL_DIR` 指定要使用的导出模型，`HC_TJ_PYTHON` 指定 Python 环境。
 
 本机脚本默认使用 `first_point_jump_rad=0.3`、`inference_hz=2.0` 和
 `latency_ewma_alpha=0.25`。两端都用 `Ctrl+C` 停止；应先停止 GPU 主机脚本，再
@@ -57,10 +121,9 @@ Joint1_R..Joint7_R, R_ban, Joint1_L..Joint7_L, L_ban
 客户端在 100 Hz 控制周期内插值、限位和限速。默认是 dry-run；只有显式加入
 `--enable-control` 才会创建命令 publisher。
 
-启用控制后，客户端会先将 17 轴主关节复位到内置默认姿态，再开始发送正式推理
-请求。复位顺序为 `Joint1_R..Joint7_R, Joint1_L..Joint7_L, leg_1, leg_2, zhi`；
-双臂以已配置的速度限制逐步靠近目标，反馈在每轴距离目标不超过 `0.02 rad` 前，
-不会调用推理服务。手部不会在复位阶段发布命令。
+HTTP 路径需要双臂及腰部共 17 轴的真实观测，腰部状态用于计算相机外参。
+网关的机械臂动作仅包含双臂 14 轴，手部使用独立命令话题；不会将腰部观测回写为
+腰部命令。HTTP 客户端不会执行下文 ROS 直连示例中的自动复位步骤。
 
 ## 前置安全条件
 
@@ -72,10 +135,12 @@ Joint1_R..Joint7_R, R_ban, Joint1_L..Joint7_L, L_ban
 - `--allow-competing-publishers` 仅用于隔离调试，禁止在正常真机运行中使用。
 - 故障不会自动恢复。排查原因、确认机器人安全后重启客户端。
 
-## GPU 服务端
+## GPU 服务端与 v1 观测格式
 
-服务端继续保留旧的 `/{server_name}` 接口。HC-TJ 异步客户端只连接版本化端点
-`/{server_name}/hc_tj_async/v1`。新端点接收 multipart `.npy`：
+普通服务端保留旧的 `/{server_name}` 和 `/{server_name}/hc_tj_async/v1` 接口。
+DAgger 启动器使用经过鉴权的 `/{server_name}/hc_tj_async/v2`，控制窗口只决定结果
+是否可执行，不阻止模型计算。v1/v2 观测字段相同；v2 另外携带控制窗口标识。
+观测端点接收 multipart `.npy`：
 
 | 字段 | 契约 |
 | --- | --- |

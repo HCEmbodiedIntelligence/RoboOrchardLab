@@ -16,15 +16,23 @@
 
 import json
 import sys
+import threading
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
+import requests
 
-from projects.holobrain.scripts import hc_tj_http_async_client as http_client
+from projects.holobrain.scripts import (
+    hc_tj_http_async_client as http_client,
+    hc_tj_http_robot_gateway as gateway_module,
+)
 from projects.holobrain.scripts.hc_tj_async_core import (
     ARM_JOINT_NAMES,
     CONTROL_JOINT_NAMES,
+    ActionDiscontinuityError,
     ProtocolError,
+    validate_action_chunk,
 )
 from projects.holobrain.scripts.hc_tj_http_async_client import (
     HcTjHttpAsyncClientConfig,
@@ -418,9 +426,119 @@ class TestHttpClientBoundary:
 
         assert gateway.enable_control is False
         assert gateway.enable_hands is False
+        assert gateway.extrinsics_durability == "transient_local"
         assert gateway.action_timeout_s == 0.75
         assert gateway.first_point_jump_rad == 0.3
         assert client.enable_control is False
         assert client.inference_hz == 2.0
         assert client.latency_ewma_alpha == 0.25
         assert client.first_point_jump_rad == 0.3
+
+    @pytest.mark.parametrize(
+        ("field", "topic"),
+        [
+            ("joint_command_topic", "/action/joint_states"),
+            ("right_hand_topic", "/action/right_hand/joint_states"),
+            ("left_hand_topic", "/action/left_hand/joint_states"),
+        ],
+    )
+    def test_dagger_rejects_hardware_output_topics(
+        self, tmp_path, field, topic
+    ):
+        urdf = tmp_path / "robot.urdf"
+        urdf.write_text("<robot/>")
+        settings = dict(
+            token="0123456789abcdef",
+            enable_control=True,
+            enable_hands=True,
+            enable_dagger=True,
+            urdf_path=urdf,
+        )
+        GatewayConfig(**settings)
+        with pytest.raises(ValueError, match="HC middleware owns"):
+            GatewayConfig(**settings, **{field: topic})
+        # Standalone v1 retains its explicit direct-driver deployment option.
+        settings["enable_dagger"] = False
+        GatewayConfig(**settings, **{field: topic})
+
+    def test_gateway_cli_selects_periodic_extrinsics(self, monkeypatch):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "gateway",
+                "--token", "0123456789abcdef",
+                "--calibration-topic", "/observation/cameras/head/calibration",
+                "--extrinsics-topic", "/observation/cameras/head/extrinsics",
+                "--extrinsics-durability", "volatile",
+            ],
+        )
+        config = gateway_module._parse_args()
+        assert config.extrinsics_durability == "volatile"
+        assert config.calibration_topic.endswith("/head/calibration")
+        assert config.extrinsics_topic.endswith("/head/extrinsics")
+        with pytest.raises(ValueError, match="extrinsics durability"):
+            GatewayConfig(
+                token="0123456789abcdef", extrinsics_durability="invalid"
+            )
+
+
+def test_discontinuity_type_preserves_first_point_limit():
+    actions = np.zeros((2, 16))
+    actions[:, 0] = 0.3
+    validate_action_chunk(
+        actions, np.zeros(14), first_point_jump_rad=0.3
+    )
+    actions[:, 0] = 0.321770
+    with pytest.raises(ActionDiscontinuityError, match="0.321770"):
+        validate_action_chunk(
+            actions, np.zeros(14), first_point_jump_rad=0.3
+        )
+    actions[:, 0] = np.nan
+    with pytest.raises(ValueError) as error:
+        validate_action_chunk(actions, np.zeros(14))
+    assert not isinstance(error.value, ActionDiscontinuityError)
+
+
+@pytest.mark.parametrize(
+    "rejection,expected_type",
+    [
+        (ActionDiscontinuityError("first action jumps"),
+         ActionDiscontinuityError),
+        (ValueError("invalid action"), RuntimeError),
+        (PermissionError("forbidden"), RuntimeError),
+    ],
+)
+def test_http_round_trip_identifies_only_discontinuity_as_replannable(
+    rejection, expected_type
+):
+    # A loopback server exercises the production protocol without ROS or
+    # hardware. No robot endpoint or real control identity is involved.
+    gateway = Mock()
+    gateway.config = GatewayConfig(
+        token="0123456789abcdef", enable_dagger=True
+    )
+    gateway.accept_action_chunk.side_effect = rejection
+    server = gateway_module._GatewayHTTPServer(("127.0.0.1", 0), gateway)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        config = HcTjHttpAsyncClientConfig(
+            robot_url=f"http://127.0.0.1:{server.server_port}",
+            robot_token=gateway.config.token,
+            server_url="http://gpu:2000/holobrain/hc_tj_async/v2",
+            instruction="test",
+            depth_units_per_meter=1000,
+            enable_dagger=True,
+        )
+        with requests.Session() as session:
+            session.trust_env = False
+            with pytest.raises(expected_type):
+                http_client._send_action_chunk(
+                    session, config, 1, np.zeros((2, 16)), "test-window"
+                )
+        assert gateway.accept_action_chunk.call_count == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=2)
