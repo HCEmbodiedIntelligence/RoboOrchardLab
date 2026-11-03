@@ -886,6 +886,11 @@ class ROMultiRowDataset(RODataset):
     the returned row will be a list of rows. If the column is not
     in the row_sampler, it will return a single row for that column.
 
+    Samplers may exclude sample anchors via ``get_sample_indices``. In that
+    case length and integer/list/slice access refer to retained samples, while
+    frame_dataset and index_dataset retain all source rows. Returned metadata
+    indices continue to identify the original source frames.
+
     Args:
         dataset_path (str): The path to the dataset directory.
         row_sampler (MultiRowSamplerConfig): The configuration for the
@@ -921,6 +926,9 @@ class ROMultiRowDataset(RODataset):
     def _set_row_sampler(self, row_sampler: MultiRowSampler) -> None:
         """Set the row sampler for the dataset."""
         self._row_sampler: MultiRowSampler = row_sampler
+        self._sample_indices = row_sampler.get_sample_indices(
+            self.index_dataset
+        )
         for col_name in self._row_sampler.column_rows_keys:
             if col_name not in self._column_datasets:
                 if col_name not in self.frame_dataset.column_names:
@@ -931,6 +939,42 @@ class ROMultiRowDataset(RODataset):
             self._column_datasets[col_name] = (
                 self.frame_dataset.select_columns(column_names=col_name)
             )
+
+    def __len__(self) -> int:
+        """Return the number of eligible sample anchors."""
+        if self._sample_indices is not None:
+            return len(self._sample_indices)
+        return super().__len__()
+
+    def select(
+        self,
+        indices: Iterable,
+        keep_in_memory: bool = False,
+        indices_cache_file_name: str | None = None,
+        writer_batch_size: int = 1000,
+        new_fingerprint: str | None = None,
+    ) -> Self:
+        """Select sample anchors while preserving source rows for chunks.
+
+        For unfiltered samplers, retain RODataset's frame-selection behavior.
+        With filtered anchors, HF cache kwargs are unused because only the
+        in-memory anchor mapping changes.
+        """
+        if self._sample_indices is None:
+            ret = super().select(
+                indices,
+                keep_in_memory,
+                indices_cache_file_name,
+                writer_batch_size,
+                new_fingerprint,
+            )
+            ret._column_datasets = {}
+            ret._set_row_sampler(ret.row_sampler)
+            return ret
+        ret = type(self).__new__(type(self))
+        ret.__dict__.update(self._get_state_())
+        ret._sample_indices = [self._sample_indices[i] for i in indices]
+        return ret
 
     @staticmethod
     def from_dataset(
@@ -974,6 +1018,11 @@ class ROMultiRowDataset(RODataset):
         # ['joints', 'actions', 'head', 'head_depth', 'index', 'episode_index', 
         # 'frame_index', 'task_index', 'robot_index', 'instruction_index', 
         # 'timestamp_min', 'timestamp_max']
+        if self._sample_indices is not None:
+            if isinstance(index, (int, slice)):
+                index = self._sample_indices[index]
+            else:
+                index = [self._sample_indices[i] for i in index]
         cached_index_dataset = CachedIndexDataset(self.index_dataset)
 
 

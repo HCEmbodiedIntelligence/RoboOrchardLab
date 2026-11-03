@@ -99,8 +99,8 @@ class SimpleStateSampling:
     """把一整段关节序列整理成“历史观测输入”和“未来动作监督”，供 HoloBrain 训练或推理使用
        从数据集中已有的轨迹里选出历史状态和未来64步监督标签。
        未来标签是 HoloBrain 动作预测分支的主要训练目标，不只是辅助 loss。
-
     """
+    # NOTE: 这里是在EpisodeChunkSampler 获取到的片段中处理，因此EpisodeChunkSampler中pad的动作不会记入pred_mask
     def __init__(
         self,
         hist_steps,
@@ -196,6 +196,7 @@ class SimpleStateSampling:
                 joint_state = master_joint_state
             state[:, : joint_state.shape[1]] = joint_state
 
+        # 跳过静止片段
         idx = step_index + 1
         if idx < len(joint_state) - 1 and self.static_threshold > 0:
             static_mask = np.any(
@@ -205,6 +206,7 @@ class SimpleStateSampling:
             )
             idx += np.argmax(static_mask)
 
+        # 跳过静止片段可能导致未来预测片段不足 pred_steps，复制补齐后续帧，并在 mask 中标记为无效，不参与loss计算
         pred_state = state[idx : idx + pred_steps]
         pred_mask = mask[idx : idx + pred_steps]
         if pred_state.shape[0] != pred_steps:

@@ -383,7 +383,11 @@ def build_transforms(config, mode, data_config):
 @train_dataset_register()
 @validation_dataset_register()
 def build_datasets(config, dataset_names, mode, **kwargs):
-    """Build the registered hc_tj training or validation dataset."""
+    """Build the registered hc_tj training or validation dataset.
+
+    Set config["drop_incomplete_chunks"] to True to exclude sample anchors
+    without a full future chunk. By default, episode tails are padded.
+    """
     from robo_orchard_lab.dataset.hc_tj import HcTjRODataset
     from robo_orchard_lab.utils.build import build
     from robo_orchard_lab.utils.misc import as_sequence
@@ -419,6 +423,7 @@ def build_datasets(config, dataset_names, mode, **kwargs):
             paths=paths,
             hist_steps=config["hist_steps"],
             pred_steps=config["pred_steps"],
+            drop_incomplete_chunks=config.get("drop_incomplete_chunks", False),
             joint_names=data_config["joint_names"],
             transforms=[build(item) for item in as_sequence(transforms)],
         )

@@ -16,11 +16,15 @@
 
 import pytest
 from datasets import Dataset
+from sqlalchemy import create_engine
+from torch.utils.data import DataLoader
 
 from robo_orchard_lab.dataset.horizon_manipulation.row_sampler import (
     EpisodeChunkSampler,
     EpisodeChunkSamplerConfig,
 )
+from robo_orchard_lab.dataset.robot.columns import PreservedIndexColumnsKeys
+from robo_orchard_lab.dataset.robot.dataset import RODataset, ROMultiRowDataset
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -225,3 +229,92 @@ class TestEpisodeChunkSamplerConfig:
         sampler = _sampler(hist_steps=3, pred_steps=0, pred_interval=1)
         result = sampler.sample_row_idx(ds, index=5)
         assert result["obs"] == [3, 4, 5]
+
+
+class TestDropIncompleteChunks:
+    @pytest.mark.parametrize(
+        "lengths,pred_steps,interval,expected",
+        [
+            ([10, 10], 4, 1, [0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15]),
+            ([10, 10], 4, 2, [0, 1, 10, 11]),
+            ([4, 5, 2], 4, 1, [4]),
+            ([2, 3], 4, 1, []),
+            ([2, 1], 0, 1, [0, 1, 2]),
+            ([], 4, 1, []),
+        ],
+    )
+    def test_eligible_anchors(self, lengths, pred_steps, interval, expected):
+        ds = _make_dataset(lengths)
+        cfg = EpisodeChunkSamplerConfig(
+            target_columns=["obs"],
+            hist_steps=3,
+            pred_steps=pred_steps,
+            pred_interval=interval,
+            drop_incomplete_chunks=True,
+        )
+        # Exercise serialized config loading as well as direct construction.
+        sampler = EpisodeChunkSamplerConfig.model_validate_json(
+            cfg.model_dump_json()
+        )()
+        assert sampler.get_sample_indices(ds) == expected
+        for index in expected:
+            rows = sampler.sample_row_idx(ds, index)["obs"]
+            assert len(rows) == 3 + pred_steps
+            if pred_steps:
+                assert rows[-1] == index + pred_steps * interval
+        for index in set(range(len(ds))) - set(expected):
+            with pytest.raises(ValueError, match="incomplete future chunk"):
+                sampler.sample_row_idx(ds, index)
+
+    def test_default_keeps_all_anchors(self, two_episode_dataset):
+        assert _sampler().get_sample_indices(two_episode_dataset) is None
+
+    @pytest.mark.parametrize("drop", [False, True])
+    @pytest.mark.parametrize("pred_steps", [2, 5])
+    def test_dataset_and_dataloader(self, drop, pred_steps):
+        columns = {name: [0] * 10 for name in PreservedIndexColumnsKeys}
+        columns.update(
+            index=list(range(10)),
+            episode_index=[0] * 5 + [1] * 5,
+            frame_index=list(range(5)) * 2,
+            obs=list(range(10)),
+        )
+        engine = create_engine("sqlite:///:memory:")
+        try:
+            base = RODataset.from_dataset(Dataset.from_dict(columns), engine)
+            dataset = ROMultiRowDataset.from_dataset(
+                base,
+                EpisodeChunkSamplerConfig(
+                    target_columns=["obs"],
+                    hist_steps=3,
+                    pred_steps=pred_steps,
+                    drop_incomplete_chunks=drop,
+                ),
+            )
+            expected = [0, 1, 2, 5, 6, 7] if drop else list(range(10))
+            if drop and pred_steps == 5:
+                expected = []
+            assert len(dataset) == len(expected)
+            assert len(dataset.frame_dataset) == 10
+            if expected:
+                assert dataset[list(range(len(dataset)))]["index"] == expected
+            else:
+                with pytest.raises(IndexError):
+                    dataset[0]
+            if pred_steps == 2:
+                assert dataset[0]["obs"] == [0, 0, 0, 1, 2]
+            if drop and expected:
+                assert dataset[:]["index"] == expected
+                assert dataset[-1]["obs"] == [5, 6, 7, 8, 9]
+                assert dataset.select([5, 0])[:]["index"] == [7, 0]
+            batches = list(DataLoader(dataset, batch_size=4, shuffle=False))
+            assert [
+                i for batch in batches for i in batch["index"].tolist()
+            ] == expected
+            dataset.row_sampler = EpisodeChunkSamplerConfig(
+                target_columns=["obs"],
+                pred_steps=2,
+            )()
+            assert len(dataset) == 10
+        finally:
+            engine.dispose()

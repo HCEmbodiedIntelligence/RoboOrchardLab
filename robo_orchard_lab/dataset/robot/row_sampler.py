@@ -114,6 +114,15 @@ def time_range_match_frame(frame: dict, ts_min: int, ts_max: int) -> bool:
 class MultiRowSampler(ClassInitFromConfigMixin, metaclass=ABCMeta):
     """Class for sampling multiple rows of specific columns from a dataset."""
 
+    def get_sample_indices(self, index_dataset: HFDataset) -> list[int] | None:
+        """Return eligible source-row anchors, or None to keep every row.
+
+        ROMultiRowDataset uses this mapping for sample access and length,
+        while retaining all source rows for chunk retrieval. Returned indices
+        must be in source-row order. An empty list excludes every sample.
+        """
+        return None
+
     @abstractmethod
     def sample_row_idx(
         self,
