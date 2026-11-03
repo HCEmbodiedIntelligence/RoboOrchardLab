@@ -18,6 +18,7 @@
 
 import json
 import sys
+import threading
 import time
 from concurrent.futures import Future
 from types import SimpleNamespace
@@ -31,6 +32,252 @@ from projects.holobrain.scripts.hc_tj_async_core import (
     TimedValue,
 )
 from projects.holobrain.scripts.hc_tj_motion import MotionInterface
+
+
+class TestContinuousExecution:
+    def test_post_stall_acceleration_uses_realized_command_velocity(
+        self, config, ros, monkeypatch
+    ):
+        clock = [100.0]
+        monkeypatch.setattr(client.time, "monotonic", lambda: clock[0])
+        node = ros.create(config(enable_control=True))
+        q = np.asarray(client.DEFAULT_JOINT_POSITIONS)
+        node._reset_complete = node._received_action_chunk = True
+        node.limiter.reset(q[:14])
+        actions = np.tile(np.r_[q[:7], 0, q[7:14], 0], (64, 1))
+        actions[:, 0] += 1
+        node._native_actions, node._native_started = actions, clock[0]
+        for _ in range(40):
+            clock[0] += 0.01
+            feedback(node, ros)
+            node._control_tick()
+        output = node.publishers[node.config.joint_command_topic].messages
+        before = output[-1].position[0]
+        clock[0] += 0.02
+        feedback(node, ros)
+        node._control_tick()
+        stalled = output[-1].position[0]
+        stalled_velocity = (stalled - before) / 0.02
+        assert stalled - before == pytest.approx(0.0025)
+        assert node.limiter.previous_velocity[0] == pytest.approx(
+            stalled_velocity
+        )
+        clock[0] += 0.01
+        feedback(node, ros)
+        node._control_tick()
+        next_velocity = (output[-1].position[0] - stalled) / 0.01
+        assert next_velocity == pytest.approx(stalled_velocity + 0.01)
+
+    @pytest.mark.parametrize("inference_hz", [2, 6, 8, 15])
+    def test_chunks_preserve_command_with_lagging_feedback(
+        self, config, ros, monkeypatch, inference_hz
+    ):
+        clock = [100.0]
+        monkeypatch.setattr(client.time, "monotonic", lambda: clock[0])
+        node = ros.create(
+            config(enable_control=True, inference_hz=inference_hz)
+        )
+        q = np.asarray(client.DEFAULT_JOINT_POSITIONS)
+        feedback(node, ros)
+        node._reset_complete = True
+        node.limiter.reset(q[:14])
+        node._received_action_chunk = True
+        node._native_started = clock[0]
+        actions = np.tile(np.r_[q[:7], 0, q[7:14], 0], (64, 1))
+        actions[:, 0] += 0.15
+        node._native_actions = actions
+        node._last_request = clock[0]
+        output = node.publishers[node.config.joint_command_topic].messages
+        for tick in range(101):
+            clock[0] = 100 + tick * 0.01
+            # Deliberately keep measured feedback behind the commands.
+            feedback(node, ros)
+            if tick and tick % max(1, round(100 / inference_hz)) == 0:
+                node._future = Future()
+                node._future_started = clock[0] - 0.025
+                node._future.set_result((actions, 0.01))
+                node._inference_tick()
+            node._control_tick()
+        positions = np.asarray([msg.position[0] for msg in output])
+        velocities = np.diff(positions) / 0.01
+        assert node.fault is None
+        assert len(output) == 101
+        assert np.min(velocities) >= -1e-8
+        assert np.max(velocities) <= 0.25 + 1e-8
+        assert np.max(np.abs(np.diff(velocities))) <= 0.01 + 1e-8
+        assert node._diagnostic_counts["limiter_resets"] == 0
+        assert positions[-1] > q[0] + 0.05
+
+    def test_rtc_and_control_share_fractional_clock_after_stall(
+        self, config, ros, monkeypatch
+    ):
+        clock = [100.0]
+        monkeypatch.setattr(client.time, "monotonic", lambda: clock[0])
+        node = ros.create(config(enable_control=True))
+        feedback(node, ros)
+        q = np.asarray(client.DEFAULT_JOINT_POSITIONS)
+        node._reset_complete = node._received_action_chunk = True
+        node.limiter.reset(q[:14])
+        actions = np.tile(np.r_[q[:7], 0, q[7:14], 0], (64, 1))
+        actions[:, 0] += np.arange(64) / 30 * 0.1
+        node._native_actions, node._native_started = actions, clock[0]
+        node._control_tick()
+        clock[0] += 0.125
+        remaining = node._remaining_actions(clock[0])
+        captured = []
+        original = client.ArmCommandLimiter.step
+
+        def record(limiter, target, period, **kwargs):
+            captured.append((target.copy(), period))
+            return original(limiter, target, period, **kwargs)
+
+        monkeypatch.setattr(client.ArmCommandLimiter, "step", record)
+        feedback(node, ros)
+        node._control_tick()
+        assert captured[0][0][0] == pytest.approx(q[0] + 0.0125)
+        assert captured[0][0][0] == pytest.approx(remaining[0, 0])
+        assert captured[0][1] == pytest.approx(0.125)
+        # A delayed tick advances trajectory time, not just one array index.
+        output = node.publishers[node.config.joint_command_topic].messages
+        assert output[-1].position[0] - output[-2].position[0] <= 0.0025
+
+    def test_full_response_age_preserves_phase(self, config, ros, monkeypatch):
+        clock = [100.0]
+        monkeypatch.setattr(client.time, "monotonic", lambda: clock[0])
+        node = ros.create(config())
+        feedback(node, ros)
+        q = np.asarray(client.DEFAULT_JOINT_POSITIONS)
+        actions = np.tile(np.r_[q[:7], 0, q[7:14], 0], (64, 1))
+        actions[:, 0] += np.arange(64) / 30 * 0.1
+        node._future = Future()
+        node._future_started = 99.875
+        node._future.set_result((actions, 0.05))
+        node._inference_tick()
+        assert node._request_elapsed_ms == pytest.approx(125)
+        assert node._remaining_actions(clock[0])[0, 0] == pytest.approx(
+            q[0] + 0.0125
+        )
+        assert node._native_started == pytest.approx(99.875)
+
+    def test_background_preparation_does_not_block_control_and_is_bounded(
+        self, config, ros, monkeypatch
+    ):
+        node = ros.create(config(enable_control=True, inference_hz=30))
+        feedback(node, ros)
+        q = np.asarray(client.DEFAULT_JOINT_POSITIONS)
+        node._reset_complete = node._received_action_chunk = True
+        node.limiter.reset(q[:14])
+        node._native_actions = np.r_[q[:7], 0, q[7:14], 0][None, :]
+        node._native_started = time.monotonic()
+        snapshot = tuple(
+            TimedValue(node.now_ns, None, time.monotonic()) for _ in range(3)
+        ) + (np.eye(4), np.eye(4))
+        monkeypatch.setattr(
+            node.observations, "synchronized", lambda: snapshot
+        )
+        entered, release = threading.Event(), threading.Event()
+        workers = []
+
+        def prepare(*args):
+            workers.append(threading.get_ident())
+            entered.set()
+            if not release.wait(2):
+                raise RuntimeError("test did not release preprocessing")
+            return {}, {}, 1
+
+        monkeypatch.setattr(client, "_build_request", prepare)
+        monkeypatch.setattr(
+            node, "_request_inference", lambda *args: (None, 0.1)
+        )
+        try:
+            node._inference_tick()
+            pending = node._future
+            assert entered.wait(1)
+            node._control_tick()
+            node._inference_tick()
+            assert node._future is pending
+            assert (
+                len(node.publishers[node.config.joint_command_topic].messages)
+                == 1
+            )
+            assert len(workers) == 1
+            assert workers[0] != threading.get_ident()
+        finally:
+            release.set()
+            node._future.result(timeout=1)
+
+    def test_new_authority_reseeds_position_and_velocity(
+        self, config, ros, monkeypatch
+    ):
+        node = ros.create(config(enable_dagger=True, control_token="x" * 16))
+        send_state(node, ros)
+        feedback(node, ros)
+        q = np.asarray(client.DEFAULT_JOINT_POSITIONS)
+        node.limiter.reset(q[:14] + 0.1)
+        node.limiter.step(q[:14] + 1, 0.01)
+        node._received_action_chunk = True
+        node.now_ns += 1
+        send_state(node, ros, "HOLD", 2)
+        node.now_ns += 1
+        send_state(node, ros, "AUTO", 3)
+        feedback(node, ros)
+        node._future = Future()
+        node._future_window = node._control_window
+        node._future_observed_s = time.monotonic()
+        actions = np.tile(np.r_[q[:7], 0, q[7:14], 0], (64, 1))
+        node._future.set_result((actions, 0.01))
+        node._inference_tick()
+        assert node.fault is None
+        np.testing.assert_allclose(node.limiter.previous, q[:14])
+        np.testing.assert_array_equal(node.limiter.previous_velocity, 0)
+        assert node._diagnostic_counts["limiter_resets"] == 1
+
+    def test_authority_revoked_during_preparation_discards_completion(
+        self, config, ros, monkeypatch
+    ):
+        node = ros.create(
+            config(
+                enable_control=True, enable_dagger=True, control_token="x" * 16
+            )
+        )
+        send_state(node, ros)
+        node._gate.resume_started -= 0.001
+        feedback(node, ros)
+        q = np.asarray(client.DEFAULT_JOINT_POSITIONS)
+        snapshot = tuple(
+            TimedValue(node.now_ns + 1, None, time.monotonic())
+            for _ in range(3)
+        ) + (np.eye(4), np.eye(4))
+        monkeypatch.setattr(
+            node.observations, "synchronized", lambda: snapshot
+        )
+        entered, release = threading.Event(), threading.Event()
+
+        def prepare(*args):
+            entered.set()
+            if not release.wait(2):
+                raise RuntimeError("test did not release preprocessing")
+            return {}, {}, 1
+
+        actions = np.tile(np.r_[q[:7], 0, q[7:14], 0], (64, 1))
+        monkeypatch.setattr(client, "_build_request", prepare)
+        monkeypatch.setattr(
+            node, "_request_inference", lambda *args: (actions, 0.01)
+        )
+        try:
+            node._inference_tick()
+            assert entered.wait(1)
+            node.now_ns += 1
+            send_state(node, ros, "HOLD", 2)
+        finally:
+            release.set()
+            node._future.result(timeout=1)
+        node._inference_tick()
+        node._control_tick()
+        assert node.fault is None
+        assert node._native_actions is None
+        assert node.limiter.previous is None
+        assert all(not pub.messages for pub in node.publishers.values())
 
 
 @pytest.fixture
@@ -319,7 +566,7 @@ class TestMotionBoundary:
         feedback(node, ros, node._motion.joint_names)
         q = np.asarray(client.DEFAULT_JOINT_POSITIONS)
         node.limiter.reset(q[:14])
-        node._control_actions = np.r_[q[:7], 0, q[7:14], 0][None, :]
+        node._native_actions = np.r_[q[:7], 0, q[7:14], 0][None, :]
         node._control_tick()
         assert node.fault is None
         assert all(len(pub.messages) == 1 for pub in node.publishers.values())
@@ -352,7 +599,7 @@ class TestMotionBoundary:
         msg = ros.Message()
         msg.data = json.dumps(motion_info())
         node._on_robot_info(msg)
-        node._control_actions = np.zeros((1, 16))
+        node._native_actions = np.zeros((1, 16))
         node.competitors[node._motion.topics[0]] = [
             SimpleNamespace(node_name="other", node_namespace="/")
         ]
@@ -370,7 +617,7 @@ def test_legacy_reset_and_hand_output_are_preserved(config, ros):
     assert len(node.publishers[cfg.joint_command_topic].messages) == 1
     assert not node.publishers[cfg.right_hand_topic].messages
     q = np.asarray(client.DEFAULT_JOINT_POSITIONS)
-    node._control_actions = np.r_[q[:7], 0.49, q[7:14], 0.5][None, :]
+    node._native_actions = np.r_[q[:7], 0.49, q[7:14], 0.5][None, :]
     node._received_action_chunk = True
     node._control_tick()
     assert node.fault is None
@@ -390,7 +637,7 @@ def test_queued_feedback_cannot_authorize_legacy_output(
     node.now_ns += 500_000_000
     node._reset_complete = reset_complete
     if reset_complete:
-        node._control_actions = np.zeros((1, 16))
+        node._native_actions = np.zeros((1, 16))
         node._received_action_chunk = True
     node._control_tick()
     assert "joint feedback source stamp is stale" in node.fault
@@ -408,7 +655,7 @@ def test_queued_feedback_cannot_reseed_limiter(config, ros):
     assert "joint feedback source stamp is stale" in node.fault
     assert node.limiter.previous is None
     assert not node._received_action_chunk
-    assert node._control_actions is None
+    assert node._native_actions is None
 
 
 def test_trimmed_jump_reports_joint_and_raw_prediction(config, ros):
@@ -426,7 +673,7 @@ def test_trimmed_jump_reports_joint_and_raw_prediction(config, ros):
     assert f"target_rad={q[11] + 0.324:.6f}" in node.fault
     assert f"feedback_rad={q[11]:.6f}" in node.fault
     assert "response_index=7 raw_first_max_delta_rad=0.000000" in node.fault
-    assert node._control_actions is None
+    assert node._native_actions is None
     assert all(not pub.messages for pub in node.publishers.values())
 
 
@@ -493,10 +740,13 @@ class TestDaggerBoundary:
             # Seven elapsed intervals shorten the tail. Point zero is first.
             np.testing.assert_array_equal(node._native_actions, actions[:5])
             output = node.publishers[node.config.joint_command_topic].messages
-            step = node.config.max_arm_velocity_rad_s / node.config.control_hz
+            step = (
+                node.config.max_arm_acceleration_rad_s2
+                / node.config.control_hz**2
+            )
             assert output[0].position[3] == pytest.approx(joints[3] - step)
         else:
-            assert node._native_actions is node._control_actions is None
+            assert node._native_actions is None
             assert all(not pub.messages for pub in node.publishers.values())
 
     def test_resume_jump_replans_from_fresh_frame_before_publishing(
@@ -525,7 +775,7 @@ class TestDaggerBoundary:
         rejected[7:, 3] = -1.337241
         # A replan may fail even after earlier chunks in this grant executed.
         node._received_action_chunk = True
-        node._control_actions = node._native_actions = safe.copy()
+        node._native_actions = safe.copy()
         node._latency_ewma = 0.245
         node._future_window = node._control_window
         node._future = Future()
@@ -536,7 +786,7 @@ class TestDaggerBoundary:
         node._inference_tick()
         node._control_tick()
         assert node.fault is None and node._jump_rejections == 1
-        assert node._native_actions is node._control_actions is None
+        assert node._native_actions is None
         assert all(not pub.messages for pub in node.publishers.values())
 
         built = []
@@ -651,14 +901,13 @@ class TestDaggerBoundary:
             )
         )
         send_state(node, ros)
-        node._native_actions = node._control_actions = np.ones((4, 16))
+        node._native_actions = np.ones((4, 16))
         node._received_action_chunk = True
-        node._control_index = 2
         node.now_ns += 1
         send_state(node, ros, "HOLD", 2)
         node._control_tick()
-        assert node._native_actions is node._control_actions is None
-        assert not node._received_action_chunk and node._control_index == 0
+        assert node._native_actions is None
+        assert not node._received_action_chunk
         assert node._reset_complete and node.fault is None
         assert all(not pub.messages for pub in node.publishers.values())
 
@@ -674,7 +923,7 @@ class TestDaggerBoundary:
         send_state(node, ros, "AUTO", 3)
         node._future.set_result((np.zeros((64, 16)), 0.01))
         node._inference_tick()
-        assert node._native_actions is node._control_actions is None
+        assert node._native_actions is None
         assert node.fault is None
 
     def test_suppressed_observations_continue_while_old_call_runs(
@@ -745,7 +994,7 @@ class TestDaggerBoundary:
         node = ros.create(config(enable_dagger=True, control_token="x" * 16))
         send_state(node, ros)
         old = node._control_window
-        node._native_actions = node._control_actions = np.zeros((64, 16))
+        node._native_actions = np.zeros((64, 16))
         node._received_action_chunk = True
         node._future_window = old
         node._future = Future()
@@ -753,7 +1002,7 @@ class TestDaggerBoundary:
         node._inference_tick()
         assert node.fault is None
         assert node._control_window != old
-        assert node._native_actions is node._control_actions is None
+        assert node._native_actions is None
         assert node._reset_complete and not node._received_action_chunk
         node.now_ns += 1
         send_state(node, ros, "AUTO", 2)
@@ -779,7 +1028,7 @@ class TestDaggerBoundary:
     ):
         node = ros.create(config(enable_dagger=True, control_token="x" * 16))
         send_state(node, ros)
-        node._native_actions = node._control_actions = np.zeros((64, 16))
+        node._native_actions = np.zeros((64, 16))
         node._latency_ewma = 1
         node.now_ns += 1
         send_state(node, ros, "HOLD", 2)
@@ -819,10 +1068,10 @@ class TestDaggerBoundary:
         feedback(node, ros)
         q = np.asarray(client.DEFAULT_JOINT_POSITIONS)
         node.limiter.reset(q[:14])
-        node._control_actions = np.r_[q[:7], 0, q[7:14], 0][None, :]
+        node._native_actions = np.r_[q[:7], 0, q[7:14], 0][None, :]
         node._received_action_chunk = True
 
-        def revoke_while_preparing(*args):
+        def revoke_while_preparing(*args, **kwargs):
             node._gate.invalidate("pause")
             return q[:14]
 
@@ -831,7 +1080,7 @@ class TestDaggerBoundary:
         )
         node._control_tick()
         assert node.fault is None
-        assert node._native_actions is node._control_actions is None
+        assert node._native_actions is None
         assert all(not pub.messages for pub in node.publishers.values())
 
     def test_legacy_hands_publish_and_feed_inference_without_feedback(
@@ -847,7 +1096,7 @@ class TestDaggerBoundary:
         feedback(node, ros)
         q = np.asarray(client.DEFAULT_JOINT_POSITIONS)
         node.limiter.reset(q[:14])
-        node._control_actions = np.r_[q[:7], 0.4, q[7:14], 0.6][None, :]
+        node._native_actions = np.r_[q[:7], 0.4, q[7:14], 0.6][None, :]
         node._received_action_chunk = True
         window = node._control_window
         node._control_tick()
@@ -889,8 +1138,8 @@ class TestDaggerBoundary:
         assert node.config.hand_state_topic in node.subscriptions
         send_state(node, ros)
         old = node._control_window
-        node._native_actions = node._control_actions = np.zeros((64, 16))
+        node._native_actions = np.zeros((64, 16))
         node._received_action_chunk = True
         assert not node._hands_ready()
         assert node._control_window != old
-        assert node._native_actions is node._control_actions is None
+        assert node._native_actions is None

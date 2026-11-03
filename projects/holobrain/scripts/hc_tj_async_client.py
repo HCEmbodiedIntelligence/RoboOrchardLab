@@ -52,12 +52,12 @@ from projects.holobrain.scripts.hc_tj_async_core import (  # noqa: E402
     TimedValue,
     arm_actions,
     hand_command,
-    interpolate_actions,
     load_arm_joint_limits,
     measured_hand_closures,
     nearest_timed_value,
     parse_camera_calibration,
     parse_robot_camera_extrinsics,
+    sample_actions,
     trim_elapsed_actions,
     validate_action_chunk,
     validate_inference_response,
@@ -136,6 +136,8 @@ class HcTjAsyncClientConfig:
     camera_timeout_s: float = 1.0
     state_timeout_s: float = 0.25
     max_arm_velocity_rad_s: float = 0.25
+    max_arm_acceleration_rad_s2: float = 1.0
+    """Command acceleration bound retained across chunks, in rad/s²."""
     first_point_jump_rad: float = 0.30
     latency_ewma_alpha: float = 0.25
     color_topic: str = "/observation/cameras/head/color/compressed"
@@ -185,6 +187,11 @@ class HcTjAsyncClientConfig:
             raise ValueError("camera and state timeouts must be positive")
         if self.max_arm_velocity_rad_s <= 0:
             raise ValueError("arm velocity must be positive")
+        if (
+            not math.isfinite(self.max_arm_acceleration_rad_s2)
+            or self.max_arm_acceleration_rad_s2 <= 0
+        ):
+            raise ValueError("arm acceleration must be finite and positive")
         if self.first_point_jump_rad <= 0:
             raise ValueError("first_point_jump_rad must be positive")
         if not 0 < self.latency_ewma_alpha <= 1:
@@ -473,7 +480,10 @@ def _ros_node_class():
             self.observations = ObservationBuffer()
             lower, upper = load_arm_joint_limits(config.urdf_path)
             self.limiter = ArmCommandLimiter(
-                lower, upper, config.max_arm_velocity_rad_s
+                lower,
+                upper,
+                config.max_arm_velocity_rad_s,
+                max_acceleration_rad_s2=config.max_arm_acceleration_rad_s2,
             )
             self._default_joint_positions = np.asarray(
                 DEFAULT_JOINT_POSITIONS, dtype=np.float64
@@ -485,8 +495,11 @@ def _ros_node_class():
                     "default arm posture is outside the HC-TJ URDF limits"
                 )
             self._lock = threading.RLock()
-            self._worker = ThreadPoolExecutor(max_workers=1)
+            # One inference plus at most one server-suppressed observation
+            # while an invalidated inference is still finishing.
+            self._worker = ThreadPoolExecutor(max_workers=2)
             self._future: Future | None = None
+            self._discard_future: Future | None = None
             self._future_window = ""
             self._future_started = 0.0
             self._future_observed_s = -math.inf
@@ -506,8 +519,6 @@ def _ros_node_class():
             self._latency_ewma: float | None = None
             self._native_actions: np.ndarray | None = None
             self._native_started = 0.0
-            self._control_actions: np.ndarray | None = None
-            self._control_index = 0
             self._received_action_chunk = False
             self._right_hand_observation = 0.0
             self._left_hand_observation = 0.0
@@ -634,6 +645,9 @@ def _ros_node_class():
                 + json.dumps(
                     {
                         "arm_velocity_rad_s": config.max_arm_velocity_rad_s,
+                        "arm_acceleration_rad_s2": (
+                            config.max_arm_acceleration_rad_s2
+                        ),
                         "step_rad": config.max_arm_velocity_rad_s
                         / config.control_hz,
                         "first_point_jump_rad": config.first_point_jump_rad,
@@ -697,9 +711,16 @@ def _ros_node_class():
                             self._publish_gap_max_ms, 2
                         ),
                         "action_points_left": max(
-                            0, len(self._control_actions) - self._control_index
+                            0,
+                            math.ceil(
+                                (
+                                    len(self._native_actions) / ACTION_HZ
+                                    - max(0.0, now - self._native_started)
+                                )
+                                * self.config.control_hz
+                            ),
                         )
-                        if self._control_actions is not None
+                        if self._native_actions is not None
                         else 0,
                         "max_clip_rad": self.limiter.max_clip_rad,
                         "allowed": state.get("allowed"),
@@ -727,7 +748,7 @@ def _ros_node_class():
                 first_fault = self._fault is None
                 if first_fault:
                     self._fault = reason
-                    self._control_actions = None
+                    self._native_actions = None
             if first_fault:
                 self.get_logger().error(
                     f"Latched fault; restart required: {reason}"
@@ -839,10 +860,10 @@ def _ros_node_class():
 
         def _clear_trajectory(self) -> None:
             """Drop queued output and RTC history under the action lock."""
-            self._native_actions = self._control_actions = None
+            self._native_actions = None
             self._native_started = 0.0
-            self._control_index = 0
             self._received_action_chunk = False
+            self._last_publish_time = None
             self._latency_ewma = None
             self._resume_stamp_ns = self.get_clock().now().nanoseconds
 
@@ -942,8 +963,17 @@ def _ros_node_class():
                 if self._native_actions is None:
                     return None
                 elapsed = max(0.0, now - self._native_started)
-                remaining = trim_elapsed_actions(self._native_actions, elapsed)
-                return remaining.copy() if len(remaining) else None
+                duration = len(self._native_actions) / ACTION_HZ
+                if elapsed >= duration:
+                    return None
+                times = (
+                    elapsed
+                    + np.arange(
+                        int(math.ceil((duration - elapsed) * ACTION_HZ))
+                    )
+                    / ACTION_HZ
+                )
+                return sample_actions(self._native_actions, times)
 
         def _execution_chunk(
             self, actions: np.ndarray, elapsed: float, starting: bool
@@ -956,11 +986,13 @@ def _ros_node_class():
                     return actions[:0], 0
                 steps = len(trim_elapsed_actions(actions, age))
                 return actions[:steps], 0
-            remaining = trim_elapsed_actions(actions, elapsed)
-            if len(remaining) == 0:
+            steps = len(trim_elapsed_actions(actions, elapsed))
+            if steps == 0:
                 self._diagnostic_counts["chunk_fully_elapsed"] += 1
-                remaining = actions[-1:]
-            return remaining, len(actions) - len(remaining)
+                return actions[-1:], len(actions) - 1
+            return sample_actions(
+                actions, elapsed + np.arange(steps) / ACTION_HZ
+            ), len(actions) - steps
 
         def _check_feedback_freshness(self, sample: TimedValue) -> None:
             """Reject stalled delivery and queued old control feedback."""
@@ -999,11 +1031,26 @@ def _ros_node_class():
                 if not self._reset_complete:
                     return
             now = time.monotonic()
+            if (
+                self._discard_future is not None
+                and self._discard_future.done()
+            ):
+                discarded, self._discard_future = self._discard_future, None
+                try:
+                    discarded.result()
+                except Exception as error:
+                    self.get_logger().warning(
+                        f"Suppressed observation request failed: {error}"
+                    )
             if self._future is not None and self._future.done():
                 future, self._future = self._future, None
                 future_window = self._future_window
                 try:
                     actions, elapsed = future.result()
+                    # Include worker preparation, response decoding and the
+                    # wait for this callback, all from the RTC snapshot time.
+                    if self._future_started > 0:
+                        elapsed = max(elapsed, now - self._future_started)
                     self._diagnostic_counts["completed"] += 1
                     self._request_elapsed_ms = elapsed * 1000
                     # Invalidated results and errors cannot poison a new
@@ -1052,9 +1099,6 @@ def _ros_node_class():
                                 f"raw_first_max_delta_rad={raw_jump:.6f} "
                                 f"request_ms={elapsed * 1000:.2f}"
                             ) from error
-                        control = interpolate_actions(
-                            remaining, target_hz=int(self.config.control_hz)
-                        )
                         with self._gate.lock, self._lock:
                             if state is not None and (
                                 not self._gate.allows(future_window)
@@ -1069,15 +1113,17 @@ def _ros_node_class():
                                 + (1 - alpha) * self._latency_ewma
                             )
                             self._native_actions, self._native_started = (
-                                remaining.copy(),
-                                time.monotonic(),
+                                remaining.copy()
+                                if starting
+                                else actions.copy(),
+                                time.monotonic()
+                                if starting
+                                else now - elapsed,
                             )
-                            self._control_actions, self._control_index = (
-                                control,
-                                0,
-                            )
-                            self.limiter.reset(feedback)
-                            self._diagnostic_counts["limiter_resets"] += 1
+                            if not self._received_action_chunk:
+                                self.limiter.reset(feedback)
+                                self._last_publish_time = None
+                                self._diagnostic_counts["limiter_resets"] += 1
                             self._received_action_chunk = True
                             self._jump_rejections = 0
                             self._diagnostic_counts["chunks_accepted"] += 1
@@ -1104,6 +1150,10 @@ def _ros_node_class():
             if self._future is not None and allowed:
                 self._inference_wait = "inference_inflight"
                 return
+            if not allowed and self._discard_future is not None:
+                self._inference_wait = "suppressed_observation_inflight"
+                return
+            now = time.monotonic()
             if now - self._last_request < 1.0 / self.config.inference_hz:
                 self._inference_wait = "configured_request_period"
                 return
@@ -1159,18 +1209,7 @@ def _ros_node_class():
             )
             if remaining is not None:
                 delay = min(delay, len(remaining))
-            try:
-                files, form, _ = _build_request(
-                    snapshot,
-                    self.config,
-                    right_hand,
-                    left_hand,
-                    remaining,
-                    delay,
-                )
-            except Exception as error:
-                self._latch_fault(f"observation/protocol failure: {error}")
-                return
+            form = {}
             if state is not None:
                 form.update(
                     control_window=window,
@@ -1180,14 +1219,48 @@ def _ros_node_class():
             self._last_observation_timestamp_ns = snapshot[0].timestamp_ns
             self._diagnostic_counts["requests"] += 1
 
-            self._future_started = now
-            self._future_observed_s = min(
-                item.received_monotonic_s for item in snapshot[:3]
+            future = self._worker.submit(
+                self._prepare_and_request,
+                snapshot,
+                right_hand,
+                left_hand,
+                remaining,
+                delay,
+                form,
             )
-            self._future_window = window
-            self._future = self._worker.submit(
-                self._request_inference, files, form
+            if not allowed:
+                self._discard_future = future
+            else:
+                self._future_started = now
+                self._future_observed_s = min(
+                    item.received_monotonic_s for item in snapshot[:3]
+                )
+                self._future_window = window
+                self._future = future
+
+        def _prepare_and_request(
+            self,
+            snapshot: tuple[
+                TimedValue, TimedValue, TimedValue, np.ndarray, np.ndarray
+            ],
+            right_hand: float,
+            left_hand: float,
+            remaining: np.ndarray | None,
+            delay: int,
+            metadata: dict[str, str],
+        ) -> tuple[np.ndarray | None, float]:
+            """Build and send a snapshot in the worker, without ROS mutation.
+
+            Snapshot arrays are owned copies or immutable buffer entries.
+            Authority metadata belongs to submission time; the ROS callback
+            rejects completions from invalidated windows. Exceptions travel
+            through the future into the existing fault handling.
+            """
+            files, form, _ = _build_request(
+                snapshot, self.config, right_hand, left_hand, remaining, delay
             )
+            form.update(metadata)
+            return self._request_inference(files, form)
 
         def _request_inference(
             self,
@@ -1233,7 +1306,7 @@ def _ros_node_class():
             with self._lock:
                 if (
                     self._reset_complete
-                    and self._control_actions is None
+                    and self._native_actions is None
                     and not self._received_action_chunk
                 ):
                     self._control_wait = "awaiting_first_action"
@@ -1262,6 +1335,12 @@ def _ros_node_class():
                 return
             try:
                 self._check_feedback_freshness(feedback_sample)
+                now = time.monotonic()
+                period = 1.0 / self.config.control_hz
+                if self._last_publish_time is not None:
+                    period = now - self._last_publish_time
+                    if period <= 0:
+                        return
                 with self._lock:
                     if not self._reset_complete:
                         if not self._reset_limiter_initialized:
@@ -1269,7 +1348,8 @@ def _ros_node_class():
                             self._reset_limiter_initialized = True
                         arm = self.limiter.step(
                             self._default_joint_positions[:14],
-                            1.0 / self.config.control_hz,
+                            period,
+                            max_step_seconds=1.0 / self.config.control_hz,
                         )
                         action = None
                         reset_complete = np.all(
@@ -1282,23 +1362,23 @@ def _ros_node_class():
                         if reset_complete:
                             self._reset_complete = True
                     else:
-                        if self._control_actions is None:
+                        if self._native_actions is None:
                             if not self._received_action_chunk:
                                 return
                             raise ValueError("action trajectory is empty")
-                        if self._control_index >= len(self._control_actions):
+                        elapsed = max(0.0, now - self._native_started)
+                        if elapsed >= len(self._native_actions) / ACTION_HZ:
                             self._diagnostic_counts["tail_hold_ticks"] += 1
                             self._control_wait = (
                                 "trajectory_exhausted_hold_last"
                             )
-                            action = self._control_actions[-1].copy()
-                        else:
-                            action = self._control_actions[
-                                self._control_index
-                            ].copy()
-                            self._control_index += 1
+                        action = sample_actions(
+                            self._native_actions, np.asarray([elapsed])
+                        )[0]
                         arm = self.limiter.step(
-                            arm_actions(action), 1.0 / self.config.control_hz
+                            arm_actions(action),
+                            period,
+                            max_step_seconds=1.0 / self.config.control_hz,
                         )
                 joint_message = JointState()
                 joint_message.header.stamp = self.get_clock().now().to_msg()
@@ -1406,6 +1486,12 @@ def _parse_args() -> HcTjAsyncClientConfig:
         "--hand-state-topic", default="/observation/hands/joint_states"
     )
     parser.add_argument("--control-hz", type=float, default=100.0)
+    parser.add_argument(
+        "--max-arm-acceleration-rad-s2",
+        type=float,
+        default=1.0,
+        help="Command acceleration limit retained across inference chunks",
+    )
     parser.add_argument("--allow-competing-publishers", action="store_true")
     parser.add_argument("--inference-hz", type=float, default=2.0)
     parser.add_argument("--request-timeout-s", type=float, default=30.0)

@@ -52,6 +52,7 @@ __all__ = [
     "nearest_timed_value",
     "parse_camera_calibration",
     "parse_robot_camera_extrinsics",
+    "sample_actions",
     "trim_elapsed_actions",
     "validate_action_chunk",
     "validate_inference_request",
@@ -410,6 +411,37 @@ def interpolate_actions(
     ).astype(np.float32)
 
 
+def sample_actions(
+    actions: np.ndarray, times: np.ndarray, *, source_hz: float = ACTION_HZ
+) -> np.ndarray:
+    """Sample a trajectory at fractional seconds, holding its endpoints.
+
+    Return a new array with one row per time. The last action owns one full
+    source period; callers decide when that duration has expired.
+    """
+    values = np.asarray(actions)
+    times = np.asarray(times, dtype=np.float64)
+    if (
+        values.ndim != 2
+        or not len(values)
+        or not np.all(np.isfinite(values))
+        or times.ndim != 1
+        or not np.all(np.isfinite(times))
+        or not math.isfinite(source_hz)
+        or source_hz <= 0
+    ):
+        raise ValueError(
+            "finite actions, times and positive source_hz required"
+        )
+    indices = np.clip(times * source_hz, 0, len(values) - 1)
+    lower = indices.astype(np.int64)
+    upper = np.minimum(lower + 1, len(values) - 1)
+    weight = (indices - lower)[:, None]
+    return ((1 - weight) * values[lower] + weight * values[upper]).astype(
+        np.result_type(values.dtype, np.float32)
+    )
+
+
 def arm_actions(actions: np.ndarray) -> np.ndarray:
     """Slice 16-axis actions into right-then-left arm commands."""
     values = np.asarray(actions)
@@ -524,7 +556,13 @@ def validate_action_chunk(
 
 @dataclass(slots=True)
 class ArmCommandLimiter:
-    """Apply URDF position bounds and per-cycle arm velocity limits."""
+    """Limit successive arm commands, retaining state across trajectory chunks.
+
+    Call ``reset`` only when initializing or explicitly resynchronizing a
+    control session. Optional acceleration limiting retains command velocity;
+    hard position and displacement bounds take priority over acceleration.
+    An abruptly moved target can require braking past that target.
+    """
 
     lower: np.ndarray
     upper: np.ndarray
@@ -533,6 +571,10 @@ class ArmCommandLimiter:
     position_clipped: int = 0
     velocity_clipped: int = 0
     max_clip_rad: float = 0.0
+    max_acceleration_rad_s2: float | None = None
+    previous_velocity: np.ndarray = field(
+        default_factory=lambda: np.zeros(14), init=False
+    )
 
     def __post_init__(self) -> None:
         self.lower = np.asarray(self.lower, dtype=np.float64)
@@ -543,6 +585,13 @@ class ArmCommandLimiter:
             raise ValueError("arm lower limits must not exceed upper limits")
         if self.max_velocity_rad_s <= 0:
             raise ValueError("max_velocity_rad_s must be positive")
+        if self.max_acceleration_rad_s2 is not None and (
+            not math.isfinite(self.max_acceleration_rad_s2)
+            or self.max_acceleration_rad_s2 <= 0
+        ):
+            raise ValueError(
+                "max_acceleration_rad_s2 must be finite and positive"
+            )
 
     def reset(self, feedback_arm: np.ndarray) -> None:
         """Start rate limiting from the latest measured arm position."""
@@ -550,11 +599,22 @@ class ArmCommandLimiter:
         if feedback.shape != (14,) or not np.all(np.isfinite(feedback)):
             raise ValueError("feedback_arm must be finite with shape [14]")
         self.previous = np.clip(feedback, self.lower, self.upper)
+        self.previous_velocity = np.zeros(14)
 
     def step(
-        self, target_arm: np.ndarray, period_seconds: float
+        self,
+        target_arm: np.ndarray,
+        period_seconds: float,
+        *,
+        max_step_seconds: float | None = None,
     ) -> np.ndarray:
-        """Return a bounded command and store it for the next cycle."""
+        """Advance using actual elapsed time and retain realized velocity.
+
+        ``max_step_seconds`` optionally caps displacement to that duration at
+        maximum velocity. After a stalled callback this hard cap can require
+        braking faster than the acceleration bound; the next step accelerates
+        from the velocity realized over ``period_seconds``, not the cap time.
+        """
         if self.previous is None:
             raise RuntimeError("reset() must be called before step()")
         target = np.asarray(target_arm, dtype=np.float64)
@@ -562,11 +622,44 @@ class ArmCommandLimiter:
             raise ValueError("target_arm must be finite with shape [14]")
         if not math.isfinite(period_seconds) or period_seconds <= 0:
             raise ValueError("period_seconds must be finite and positive")
+        if max_step_seconds is not None and (
+            not math.isfinite(max_step_seconds) or max_step_seconds <= 0
+        ):
+            raise ValueError("max_step_seconds must be finite and positive")
         bounded = np.clip(target, self.lower, self.upper)
         max_delta = self.max_velocity_rad_s * period_seconds
         command = self.previous + np.clip(
             bounded - self.previous, -max_delta, max_delta
         )
+        if self.max_acceleration_rad_s2 is not None:
+            acceleration = self.max_acceleration_rad_s2
+            error = bounded - self.previous
+            # Reserve this step's travel before braking to a stationary target.
+            half_step = acceleration * period_seconds / 2
+            braking_speed = (
+                np.sqrt(2 * acceleration * np.abs(error) + half_step**2)
+                - half_step
+            )
+            desired_velocity = np.sign(error) * np.minimum(
+                np.minimum(np.abs(error) / period_seconds, braking_speed),
+                self.max_velocity_rad_s,
+            )
+            velocity = self.previous_velocity + np.clip(
+                desired_velocity - self.previous_velocity,
+                -acceleration * period_seconds,
+                acceleration * period_seconds,
+            )
+            command = np.clip(
+                self.previous + velocity * period_seconds,
+                self.lower,
+                self.upper,
+            )
+        if max_step_seconds is not None:
+            step_limit = self.max_velocity_rad_s * max_step_seconds
+            command = self.previous + np.clip(
+                command - self.previous, -step_limit, step_limit
+            )
+        self.previous_velocity = (command - self.previous) / period_seconds
         self.position_clipped += int(np.any(np.abs(target - bounded) > 1e-9))
         self.velocity_clipped += int(np.any(np.abs(bounded - command) > 1e-9))
         self.max_clip_rad = max(
