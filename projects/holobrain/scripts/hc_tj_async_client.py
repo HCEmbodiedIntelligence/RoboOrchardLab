@@ -1433,6 +1433,15 @@ def _ros_node_class():
                     hand_message.name = list(names)
                     hand_message.position = positions.tolist()
                     publisher.publish(hand_message)
+                with self._lock:
+                    # Estimate hand input from the last published command.
+                    # This is not measured hand position feedback.
+                    self._right_hand_observation = float(
+                        np.clip(action[7], 0, 1)
+                    )
+                    self._left_hand_observation = float(
+                        np.clip(action[15], 0, 1)
+                    )
             except Exception as error:
                 self._latch_fault(f"control safety failure: {error}")
 
