@@ -131,7 +131,7 @@ echo "[local-launcher] 客户端频率、限速与抢占日志: ${CLIENT_LOG}"
   --joint-command-topic /hc_teleop/joint_cmd \
   --right-hand-topic /hc_teleop/joint_cmd_finger_right \
   --left-hand-topic /hc_teleop/joint_cmd_finger_left \
-  --first-point-jump-rad "${HC_TJ_FIRST_POINT_JUMP_RAD:-0.60}" \
+  --first-point-jump-rad "${HC_TJ_FIRST_POINT_JUMP_RAD:-0.70}" \
   --state-timeout-s "${HC_TJ_STATE_TIMEOUT_S:-0.6}" \
   --enable-dagger \
   --enable-control 2>&1 | tee "${CLIENT_LOG}"

@@ -343,7 +343,7 @@ def run_client(config: HcTjHttpAsyncClientConfig) -> None:
         delay_horizon = int(math.ceil((latency_ewma or 0.0) * ACTION_HZ))
         if remaining is not None:
             delay_horizon = min(delay_horizon, len(remaining))
-        files, form, _ = _build_request(
+        files, form = _build_request(
             snapshot,
             config,
             right_hand_observation,
@@ -660,7 +660,7 @@ def _run_controlled_client(config: HcTjHttpAsyncClientConfig) -> None:
                         if remaining is not None
                         else 0
                     )
-                    files, form, _ = _build_request(
+                    files, form = _build_request(
                         packet_to_snapshot(packet),
                         config,
                         right_hand_observation,

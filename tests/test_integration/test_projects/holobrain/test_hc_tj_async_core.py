@@ -159,8 +159,8 @@ class TestTrajectoryAndSafety:
         limiter.reset(np.zeros(14))
         velocities = []
         for target in [1.0] * 40 + [-1.0] * 80:
-            previous = limiter.previous.copy()
-            old_velocity = limiter.previous_velocity.copy()
+            previous = limiter.previous_command.copy()
+            old_velocity = limiter.previous_command_velocity.copy()
             command = limiter.step(np.full(14, target), 0.01)
             velocity = (command - previous) / 0.01
             assert np.max(np.abs(velocity)) <= 0.25 + 1e-9
@@ -170,7 +170,7 @@ class TestTrajectoryAndSafety:
         assert velocities[40] > 0  # Brake before reversing direction.
         assert velocities[-1] < 0
         limiter.reset(np.zeros(14))
-        np.testing.assert_array_equal(limiter.previous_velocity, 0)
+        np.testing.assert_array_equal(limiter.previous_command_velocity, 0)
 
     def test_acceleration_limiter_settles_without_sustained_oscillation(self):
         limiter = ArmCommandLimiter(
@@ -182,7 +182,9 @@ class TestTrajectoryAndSafety:
         for _ in range(500):
             command = limiter.step(np.full(14, 0.1), 0.01)
         np.testing.assert_allclose(command, 0.1, atol=1e-8)
-        np.testing.assert_allclose(limiter.previous_velocity, 0, atol=1e-8)
+        np.testing.assert_allclose(
+            limiter.previous_command_velocity, 0, atol=1e-8
+        )
 
     @pytest.mark.parametrize("acceleration", [0, -1, np.nan, np.inf])
     def test_acceleration_limit_requires_finite_positive_value(
@@ -463,9 +465,13 @@ class TestObservationAndConfiguration:
         }
         buffer.set_calibration(json.dumps(calibration))
         buffer.set_extrinsics(json.dumps(extrinsics))
+        buffer.add_color(500_000_000, b"old jpeg")
         buffer.add_color(1_000_000_000, b"jpeg")
         buffer.add_depth(1_049_000_000, b"png")
         buffer.add_joints(1_019_000_000, np.zeros(17))
+        # Newer arrivals must not replace history needed by the latest RGB.
+        buffer.add_depth(2_000_000_000, b"newer png")
+        buffer.add_joints(2_000_000_000, np.ones(17))
         snapshot = buffer.synchronized()
         assert len(snapshot) == 5
         assert snapshot[0].timestamp_ns == 1_000_000_000

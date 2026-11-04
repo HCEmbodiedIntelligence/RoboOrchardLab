@@ -167,7 +167,7 @@ def _run_loop(
         if hand_inputs is not None:
             hand_inputs.append((right, left))
         remaining_inputs.append(remaining)
-        return {}, {}, None
+        return {}, {}
 
     tick = 0
     observation_count = 0

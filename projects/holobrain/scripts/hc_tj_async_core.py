@@ -562,17 +562,23 @@ class ArmCommandLimiter:
     control session. Optional acceleration limiting retains command velocity;
     hard position and displacement bounds take priority over acceleration.
     An abruptly moved target can require braking past that target.
+
+    ``previous_command`` and ``previous_command_velocity`` describe generated
+    commands, not measured motion. ``position_clipped`` counts steps with a
+    position-clipped target; ``velocity_clipped`` counts steps whose output
+    differs from that target, including acceleration and displacement limits.
+    ``reset`` preserves these statistics.
     """
 
     lower: np.ndarray
     upper: np.ndarray
     max_velocity_rad_s: float = 0.25
-    previous: np.ndarray | None = None
+    previous_command: np.ndarray | None = None
     position_clipped: int = 0
     velocity_clipped: int = 0
     max_clip_rad: float = 0.0
     max_acceleration_rad_s2: float | None = None
-    previous_velocity: np.ndarray = field(
+    previous_command_velocity: np.ndarray = field(
         default_factory=lambda: np.zeros(14), init=False
     )
 
@@ -598,8 +604,8 @@ class ArmCommandLimiter:
         feedback = np.asarray(feedback_arm, dtype=np.float64)
         if feedback.shape != (14,) or not np.all(np.isfinite(feedback)):
             raise ValueError("feedback_arm must be finite with shape [14]")
-        self.previous = np.clip(feedback, self.lower, self.upper)
-        self.previous_velocity = np.zeros(14)
+        self.previous_command = np.clip(feedback, self.lower, self.upper)
+        self.previous_command_velocity = np.zeros(14)
 
     def step(
         self,
@@ -615,7 +621,7 @@ class ArmCommandLimiter:
         braking faster than the acceleration bound; the next step accelerates
         from the velocity realized over ``period_seconds``, not the cap time.
         """
-        if self.previous is None:
+        if self.previous_command is None:
             raise RuntimeError("reset() must be called before step()")
         target = np.asarray(target_arm, dtype=np.float64)
         if target.shape != (14,) or not np.all(np.isfinite(target)):
@@ -627,45 +633,48 @@ class ArmCommandLimiter:
         ):
             raise ValueError("max_step_seconds must be finite and positive")
         bounded = np.clip(target, self.lower, self.upper)
-        max_delta = self.max_velocity_rad_s * period_seconds
-        command = self.previous + np.clip(
-            bounded - self.previous, -max_delta, max_delta
+        error = bounded - self.previous_command
+        velocity = np.clip(
+            error / period_seconds,
+            -self.max_velocity_rad_s,
+            self.max_velocity_rad_s,
         )
         if self.max_acceleration_rad_s2 is not None:
             acceleration = self.max_acceleration_rad_s2
-            error = bounded - self.previous
+            max_velocity_change = acceleration * period_seconds
             # Reserve this step's travel before braking to a stationary target.
-            half_step = acceleration * period_seconds / 2
+            half_step = max_velocity_change / 2
             braking_speed = (
                 np.sqrt(2 * acceleration * np.abs(error) + half_step**2)
                 - half_step
             )
-            desired_velocity = np.sign(error) * np.minimum(
-                np.minimum(np.abs(error) / period_seconds, braking_speed),
-                self.max_velocity_rad_s,
+            desired_velocity = np.clip(
+                velocity, -braking_speed, braking_speed
             )
-            velocity = self.previous_velocity + np.clip(
-                desired_velocity - self.previous_velocity,
-                -acceleration * period_seconds,
-                acceleration * period_seconds,
+            velocity = self.previous_command_velocity + np.clip(
+                desired_velocity - self.previous_command_velocity,
+                -max_velocity_change,
+                max_velocity_change,
             )
-            command = np.clip(
-                self.previous + velocity * period_seconds,
-                self.lower,
-                self.upper,
-            )
+        command = np.clip(
+            self.previous_command + velocity * period_seconds,
+            self.lower,
+            self.upper,
+        )
         if max_step_seconds is not None:
             step_limit = self.max_velocity_rad_s * max_step_seconds
-            command = self.previous + np.clip(
-                command - self.previous, -step_limit, step_limit
+            command = self.previous_command + np.clip(
+                command - self.previous_command, -step_limit, step_limit
             )
-        self.previous_velocity = (command - self.previous) / period_seconds
+        self.previous_command_velocity = (
+            command - self.previous_command
+        ) / period_seconds
         self.position_clipped += int(np.any(np.abs(target - bounded) > 1e-9))
         self.velocity_clipped += int(np.any(np.abs(bounded - command) > 1e-9))
         self.max_clip_rad = max(
             self.max_clip_rad, float(np.max(np.abs(target - command)))
         )
-        self.previous = command
+        self.previous_command = command
         return command.copy()
 
 

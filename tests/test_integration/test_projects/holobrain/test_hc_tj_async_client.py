@@ -21,10 +21,12 @@ import sys
 import threading
 import time
 from concurrent.futures import Future
+from io import BytesIO
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+
 from projects.holobrain.scripts import hc_tj_async_client as client
 from projects.holobrain.scripts.hc_tj_async_core import (
     CONTROL_JOINT_NAMES,
@@ -58,7 +60,7 @@ class TestContinuousExecution:
         stalled = output[-1].position[0]
         stalled_velocity = (stalled - before) / 0.02
         assert stalled - before == pytest.approx(0.0025)
-        assert node.limiter.previous_velocity[0] == pytest.approx(
+        assert node.limiter.previous_command_velocity[0] == pytest.approx(
             stalled_velocity
         )
         clock[0] += 0.01
@@ -182,7 +184,7 @@ class TestContinuousExecution:
             entered.set()
             if not release.wait(2):
                 raise RuntimeError("test did not release preprocessing")
-            return {}, {}, 1
+            return {}, {}
 
         monkeypatch.setattr(client, "_build_request", prepare)
         monkeypatch.setattr(
@@ -227,8 +229,10 @@ class TestContinuousExecution:
         node._future.set_result((actions, 0.01))
         node._inference_tick()
         assert node.fault is None
-        np.testing.assert_allclose(node.limiter.previous, q[:14])
-        np.testing.assert_array_equal(node.limiter.previous_velocity, 0)
+        np.testing.assert_allclose(node.limiter.previous_command, q[:14])
+        np.testing.assert_array_equal(
+            node.limiter.previous_command_velocity, 0
+        )
         assert node._diagnostic_counts["limiter_resets"] == 1
 
     def test_authority_revoked_during_preparation_discards_completion(
@@ -256,7 +260,7 @@ class TestContinuousExecution:
             entered.set()
             if not release.wait(2):
                 raise RuntimeError("test did not release preprocessing")
-            return {}, {}, 1
+            return {}, {}
 
         actions = np.tile(np.r_[q[:7], 0, q[7:14], 0], (64, 1))
         monkeypatch.setattr(client, "_build_request", prepare)
@@ -275,7 +279,7 @@ class TestContinuousExecution:
         node._control_tick()
         assert node.fault is None
         assert node._native_actions is None
-        assert node.limiter.previous is None
+        assert node.limiter.previous_command is None
         assert all(not pub.messages for pub in node.publishers.values())
 
 
@@ -473,6 +477,62 @@ def feedback(node, ros, names=CONTROL_JOINT_NAMES):
     node._on_joints(msg)
 
 
+class TestInferenceRequest:
+    @pytest.mark.parametrize("remaining_steps", [None, 0, 2])
+    def test_encodes_observation_and_optional_rtc(
+        self, config, remaining_steps
+    ):
+        cv2 = pytest.importorskip("cv2")
+        color = np.zeros((4, 6, 3), dtype=np.uint8)
+        depth = np.full((4, 6), 1500, dtype=np.uint16)
+        color_ok, color_bytes = cv2.imencode(".jpg", color)
+        depth_ok, depth_bytes = cv2.imencode(".png", depth)
+        assert color_ok and depth_ok
+        joints = np.arange(17, dtype=np.float64)
+        snapshot = (
+            TimedValue(1, color_bytes.tobytes()),
+            TimedValue(1, depth_bytes.tobytes()),
+            TimedValue(1, joints),
+            np.eye(4),
+            np.eye(4),
+        )
+        remaining = (
+            None
+            if remaining_steps is None
+            else np.arange(remaining_steps * 16, dtype=np.float64).reshape(
+                -1, 16
+            )
+        )
+        files, form = client._build_request(
+            snapshot, config(), 0.4, 0.6, remaining, 1
+        )
+        arrays = {
+            name: np.load(BytesIO(payload), allow_pickle=False)
+            for name, (_, payload, _) in files.items()
+        }
+        np.testing.assert_array_equal(arrays["head_color"], color)
+        np.testing.assert_array_equal(arrays["head_depth"], depth / 1000)
+        assert arrays["head_depth"].dtype == np.float32
+        np.testing.assert_allclose(
+            arrays["current_state"], np.r_[joints[:7], 0.4, joints[7:14], 0.6]
+        )
+        np.testing.assert_array_equal(arrays["head_intrinsic"], np.eye(4))
+        np.testing.assert_array_equal(arrays["zhi_to_eye"], np.eye(4))
+        assert json.loads(form["joint_names"]) == list(
+            client.HC_TJ_JOINT_NAMES
+        )
+        assert form["instruction"] == "pick"
+        if remaining_steps:
+            np.testing.assert_array_equal(
+                arrays["remaining_actions"], remaining
+            )
+            assert arrays["remaining_actions"].dtype == np.float32
+            assert form["delay_horizon"] == "1"
+        else:
+            assert "remaining_actions" not in arrays
+            assert "delay_horizon" not in form
+
+
 class TestInterfaceConfig:
     def test_joint_history_does_not_queue_commands(self, ros, config):
         cfg = config(enable_control=True)
@@ -572,6 +632,16 @@ class TestMotionBoundary:
         assert all(
             len(pub.messages[0].name) == 7 for pub in node.publishers.values()
         )
+        for offset, topic in zip((0, 7), node._motion.topics, strict=True):
+            command = node.publishers[topic].messages[0]
+            assert command.name == list(
+                node._motion.joint_names[offset : offset + 7]
+            )
+            np.testing.assert_allclose(
+                command.position, q[offset : offset + 7]
+            )
+            assert command.header.stamp.sec == 1
+            assert command.header.stamp.nanosec == 0
 
     def test_dry_run_has_no_publishers(self, config, ros):
         for motion in (False, True):
@@ -725,7 +795,7 @@ def test_queued_feedback_cannot_reseed_limiter(config, ros):
     node._future.set_result((np.zeros((8, 16)), 0.01))
     node._inference_tick()
     assert "joint feedback source stamp is stale" in node.fault
-    assert node.limiter.previous is None
+    assert node.limiter.previous_command is None
     assert not node._received_action_chunk
     assert node._native_actions is None
 
@@ -788,9 +858,7 @@ class TestDaggerBoundary:
             "synchronized",
             lambda: snapshot + (np.eye(4), np.eye(4)),
         )
-        monkeypatch.setattr(
-            client, "_build_request", lambda *args: ({}, {}, 1)
-        )
+        monkeypatch.setattr(client, "_build_request", lambda *args: ({}, {}))
         actions = np.tile(np.r_[joints[:7], 0, joints[7:14], 0], (12, 1))
         actions[:7, 3] -= 0.440730
         actions[7:, 3] = -1.337241
@@ -865,7 +933,7 @@ class TestDaggerBoundary:
         monkeypatch.setattr(
             client,
             "_build_request",
-            lambda *args: built.append(args) or ({}, {}, 1),
+            lambda *args: built.append(args) or ({}, {}),
         )
         monkeypatch.setattr(
             node, "_request_inference", lambda *args: (safe, 0.01)
@@ -989,41 +1057,77 @@ class TestDaggerBoundary:
         old = node._control_window
         node._future = Future()
         node._future_window = old
+        old_future = node._future
+        old_future.set_running_or_notify_cancel()
         node.now_ns += 1
         send_state(node, ros, "HOLD", 2)
         node.now_ns += 1
         send_state(node, ros, "AUTO", 3)
-        node._future.set_result((np.zeros((64, 16)), 0.01))
+        old_future.set_result((np.zeros((64, 16)), 0.01))
         node._inference_tick()
         assert node._native_actions is None
         assert node.fault is None
 
-    def test_suppressed_observations_continue_while_old_call_runs(
-        self, config, ros, monkeypatch
+    @pytest.mark.parametrize("outcome", ["result", "error", "cancelled"])
+    def test_takeover_stops_inference_and_resume_starts_fresh(
+        self, config, ros, monkeypatch, outcome
     ):
         node = ros.create(config(enable_dagger=True, control_token="x" * 16))
-        send_state(node, ros, "HOLD", 1)
-        node._future = Future()
+        send_state(node, ros)
+        old_future = Future()
+        if outcome != "cancelled":
+            old_future.set_running_or_notify_cancel()
+        node._future = old_future
+        node._future_window = node._control_window
+        node._native_actions = np.ones((64, 16))
+        node._received_action_chunk = True
+        node._latency_ewma = 1.0
+        node.now_ns += 1
+        send_state(node, ros, "HOLD", 2)
+        assert node._future is old_future
+        assert node._native_actions is None
+        assert node._latency_ewma is None
+        assert not node._received_action_chunk
+        monkeypatch.setattr(
+            node.observations,
+            "synchronized",
+            lambda: pytest.fail("observation accessed during takeover"),
+        )
+        node._inference_tick()
+        assert node._inference_wait == "authority_or_relay_closed"
+        node.now_ns += 1
+        send_state(node, ros, "AUTO", 3)
+        if outcome != "cancelled":
+            node._inference_tick()
+            assert node._inference_wait == "inference_inflight"
+        else:
+            assert old_future.cancelled()
+        if outcome == "error":
+            old_future.set_exception(RuntimeError("obsolete failure"))
+        elif outcome == "result":
+            old_future.set_result((np.ones((64, 16)), 0.01))
+        node._gate.resume_started -= 0.001
         snapshot = tuple(
-            TimedValue(1, b"image", time.monotonic()) for _ in range(3)
+            TimedValue(node.now_ns + 1, None, time.monotonic())
+            for _ in range(3)
         ) + (np.eye(4), np.eye(4))
         monkeypatch.setattr(
             node.observations, "synchronized", lambda: snapshot
         )
+        built = []
         monkeypatch.setattr(
-            client, "_build_request", lambda *args: ({}, {}, 1)
+            client,
+            "_build_request",
+            lambda *args: built.append(args) or ({}, {}),
         )
-        calls = []
         monkeypatch.setattr(
-            node,
-            "_request_inference",
-            lambda files, form: calls.append(form) or (None, 0.01),
+            node, "_request_inference", lambda *args: (None, 0.01)
         )
         node._inference_tick()
-        node._discard_future.result(timeout=1)
-        assert calls[0]["control_window"] == node._control_window
-        assert not node._future.done()
-        node._future.set_result((None, 0.01))
+        node._future.result(timeout=1)
+        assert built[0][-2:] == (None, 0)
+        assert node._native_actions is None
+        assert node.fault is None
 
     def test_old_joint_sample_cannot_form_resume_first_request(
         self, config, ros, monkeypatch
@@ -1118,7 +1222,7 @@ class TestDaggerBoundary:
         monkeypatch.setattr(
             client,
             "_build_request",
-            lambda *args: built.append(args) or ({}, {}, 1),
+            lambda *args: built.append(args) or ({}, {}),
         )
         monkeypatch.setattr(
             node, "_request_inference", lambda *args: (None, 0.01)
@@ -1187,7 +1291,7 @@ class TestDaggerBoundary:
         monkeypatch.setattr(
             client,
             "_build_request",
-            lambda *args: built.append(args) or ({}, {}, 1),
+            lambda *args: built.append(args) or ({}, {}),
         )
         monkeypatch.setattr(
             node, "_request_inference", lambda *args: (None, 0.01)
@@ -1215,3 +1319,83 @@ class TestDaggerBoundary:
         assert not node._hands_ready()
         assert node._control_window != old
         assert node._native_actions is None
+
+
+class TestCommandLine:
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {},
+            {
+                "enable_control": True,
+                "enable_dagger": True,
+                "control_token": "x" * 16,
+                "robot_interface": "hc_motion",
+                "motion_identity_mapping": True,
+                "allow_competing_publishers": True,
+                "inference_hz": 6.0,
+                "control_hz": 50.0,
+                "request_timeout_s": 10.0,
+                "camera_timeout_s": 2.0,
+                "state_timeout_s": 0.5,
+                "max_arm_acceleration_rad_s2": 0.5,
+                "first_point_jump_rad": 0.4,
+                "color_topic": "/custom/color",
+                "ownership_topic": "/custom/owner",
+            },
+        ],
+    )
+    def test_cli_matches_config(self, config, monkeypatch, overrides):
+        expected = config(**overrides)
+        monkeypatch.delenv("HC_TJ_GATEWAY_TOKEN", raising=False)
+        monkeypatch.delenv("HC_TJ_FIRST_POINT_JUMP_RAD", raising=False)
+        argv = [
+            "client",
+            "--server-url",
+            expected.server_url,
+            "--instruction",
+            expected.instruction,
+            "--urdf-path",
+            str(expected.urdf_path),
+            "--depth-units-per-meter",
+            str(expected.depth_units_per_meter),
+        ]
+        for name, value in overrides.items():
+            argv.append("--" + name.replace("_", "-"))
+            if value is not True:
+                argv.append(str(value))
+        monkeypatch.setattr(sys, "argv", argv)
+        assert client._parse_args() == expected
+
+    def test_environment_defaults_and_cli_precedence(
+        self, config, monkeypatch
+    ):
+        expected = config(
+            enable_dagger=True,
+            control_token="e" * 16,
+            first_point_jump_rad=0.6,
+        )
+        monkeypatch.setenv("HC_TJ_GATEWAY_TOKEN", expected.control_token)
+        monkeypatch.setenv("HC_TJ_FIRST_POINT_JUMP_RAD", "0.6")
+        argv = [
+            "client",
+            "--server-url",
+            expected.server_url,
+            "--instruction",
+            expected.instruction,
+            "--urdf-path",
+            str(expected.urdf_path),
+            "--depth-units-per-meter",
+            str(expected.depth_units_per_meter),
+            "--enable-dagger",
+        ]
+        monkeypatch.setattr(sys, "argv", argv)
+        assert client._parse_args() == expected
+        argv.extend(
+            ["--control-token", "c" * 16, "--first-point-jump-rad", "0.8"]
+        )
+        assert client._parse_args() == config(
+            enable_dagger=True,
+            control_token="c" * 16,
+            first_point_jump_rad=0.8,
+        )
