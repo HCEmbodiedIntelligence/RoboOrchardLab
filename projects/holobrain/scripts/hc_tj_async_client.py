@@ -587,6 +587,12 @@ def _ros_node_class():
             self.create_subscription(
                 String, config.extrinsics_topic, self._on_extrinsics, latched
             )
+            self.create_subscription(
+                JointState,
+                config.hand_state_topic,
+                self._on_hands,
+                latest_best_effort,
+            )
 
             self._command_qos = latest_best_effort
             if config.robot_interface is RobotInterface.MOTION:
@@ -595,13 +601,6 @@ def _ros_node_class():
                     config.robot_info_topic,
                     self._on_robot_info,
                     latched,
-                )
-            if config.robot_interface is RobotInterface.MOTION:
-                self.create_subscription(
-                    JointState,
-                    config.hand_state_topic,
-                    self._on_hands,
-                    latest_best_effort,
                 )
             if config.enable_dagger:
                 self.create_subscription(
@@ -1299,6 +1298,7 @@ def _ros_node_class():
             if not self.config.enable_control or self.fault is not None:
                 self._control_wait = "disabled_or_fault"
                 return
+            # DAgger的时候直接中断返回
             if (
                 self.config.robot_interface is RobotInterface.MOTION
                 and self._motion is None
@@ -1405,24 +1405,6 @@ def _ros_node_class():
                         message.name, message.position = list(names), positions
                         self._motion_publishers[topic].publish(message)
                 else:
-                    if action is not None:
-                        # Match ordinary X1 teleop: virtual angle in the
-                        # combined action, binary state on each hand topic.
-                        step = 3.5 / self.config.control_hz
-                        for name, closure in (
-                            ("R_ban", action[7]),
-                            ("L_ban", action[15]),
-                        ):
-                            previous = self._gripper_targets.get(name, 0.0)
-                            target = float(np.clip(closure, 0, 1)) * 1.5707
-                            position = float(
-                                np.clip(
-                                    target, previous - step, previous + step
-                                )
-                            )
-                            self._gripper_targets[name] = position
-                            joint_message.name.append(name)
-                            joint_message.position.append(position)
                     self._joint_publisher.publish(joint_message)
                 published = time.monotonic()
                 if self._last_publish_time is not None:
@@ -1451,20 +1433,7 @@ def _ros_node_class():
                     hand_message.header.stamp = joint_message.header.stamp
                     hand_message.name = list(names)
                     hand_message.position = positions.tolist()
-                    hand_message.name.append(
-                        "R_ban" if side == "right" else "L_ban"
-                    )
-                    hand_message.position.append(float(closure >= 0.5))
                     publisher.publish(hand_message)
-                with self._lock:
-                    # Estimate hand input from the last published command.
-                    # This is not measured hand position feedback.
-                    self._right_hand_observation = float(
-                        np.clip(action[7], 0, 1)
-                    )
-                    self._left_hand_observation = float(
-                        np.clip(action[15], 0, 1)
-                    )
             except Exception as error:
                 self._latch_fault(f"control safety failure: {error}")
 
