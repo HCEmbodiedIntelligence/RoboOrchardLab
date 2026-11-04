@@ -119,7 +119,7 @@ echo "[local-launcher] 客户端频率、限速与抢占日志: ${CLIENT_LOG}"
   --urdf-path "${URDF_PATH}" \
   --depth-units-per-meter "${HC_TJ_DEPTH_UNITS_PER_METER:-1000}" \
   --control-token "${HC_TJ_CONTROL_TOKEN}" \
-  --inference-hz "${HC_TJ_INFERENCE_HZ:-8.0}" \
+  --inference-hz "${HC_TJ_INFERENCE_HZ:-15.0}" \
   --control-hz "${HC_TJ_CONTROL_HZ:-100.0}" \
   --color-topic /observation/cameras/head/color/compressed \
   --depth-topic /observation/cameras/head/depth/compressed \

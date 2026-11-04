@@ -534,6 +534,7 @@ def _ros_node_class():
             self._authority_events = deque(maxlen=16)
             self._diagnostic_time = time.monotonic()
             self._last_publish_time = None
+            self._gripper_targets: dict[str, float] = {}
             self._publish_gap_max_ms = 0.0
             self._request_elapsed_ms = 0.0
             self._inference_wait = "startup"
@@ -1404,6 +1405,24 @@ def _ros_node_class():
                         message.name, message.position = list(names), positions
                         self._motion_publishers[topic].publish(message)
                 else:
+                    if action is not None:
+                        # Match ordinary X1 teleop: virtual angle in the
+                        # combined action, binary state on each hand topic.
+                        step = 3.5 / self.config.control_hz
+                        for name, closure in (
+                            ("R_ban", action[7]),
+                            ("L_ban", action[15]),
+                        ):
+                            previous = self._gripper_targets.get(name, 0.0)
+                            target = float(np.clip(closure, 0, 1)) * 1.5707
+                            position = float(
+                                np.clip(
+                                    target, previous - step, previous + step
+                                )
+                            )
+                            self._gripper_targets[name] = position
+                            joint_message.name.append(name)
+                            joint_message.position.append(position)
                     self._joint_publisher.publish(joint_message)
                 published = time.monotonic()
                 if self._last_publish_time is not None:
@@ -1432,6 +1451,10 @@ def _ros_node_class():
                     hand_message.header.stamp = joint_message.header.stamp
                     hand_message.name = list(names)
                     hand_message.position = positions.tolist()
+                    hand_message.name.append(
+                        "R_ban" if side == "right" else "L_ban"
+                    )
+                    hand_message.position.append(float(closure >= 0.5))
                     publisher.publish(hand_message)
                 with self._lock:
                     # Estimate hand input from the last published command.

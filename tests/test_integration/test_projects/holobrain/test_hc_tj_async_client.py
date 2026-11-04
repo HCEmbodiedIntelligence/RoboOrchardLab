@@ -25,7 +25,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-
 from projects.holobrain.scripts import hc_tj_async_client as client
 from projects.holobrain.scripts.hc_tj_async_core import (
     CONTROL_JOINT_NAMES,
@@ -615,6 +614,9 @@ def test_legacy_reset_and_hand_output_are_preserved(config, ros):
     node._control_tick()
     assert node._reset_complete
     assert len(node.publishers[cfg.joint_command_topic].messages) == 1
+    initial = node.publishers[cfg.joint_command_topic].messages[0]
+    assert initial.name == list(CONTROL_JOINT_NAMES)
+    assert initial.position == list(client.DEFAULT_JOINT_POSITIONS)
     assert not node.publishers[cfg.right_hand_topic].messages
     q = np.asarray(client.DEFAULT_JOINT_POSITIONS)
     node._native_actions = np.r_[q[:7], 0.49, q[7:14], 0.5][None, :]
@@ -622,9 +624,79 @@ def test_legacy_reset_and_hand_output_are_preserved(config, ros):
     node._control_tick()
     assert node.fault is None
     assert (
-        len(node.publishers[cfg.right_hand_topic].messages[0].position) == 10
+        len(node.publishers[cfg.right_hand_topic].messages[0].position) == 11
     )
+    assert node.publishers[cfg.right_hand_topic].messages[0].position[-1] == 0
+    assert node.publishers[cfg.left_hand_topic].messages[0].position[-1] == 1
     assert node._right_hand_observation == 0.49
+
+
+class TestStandardGripperFields:
+    @pytest.mark.parametrize("dagger", [False, True])
+    @pytest.mark.parametrize("closure", [0.0, 0.1, 0.49, 0.5, 1.0, 1.1])
+    def test_model_fields_preserve_arm_waist_and_finger_targets(
+        self, config, ros, monkeypatch, dagger, closure
+    ):
+        clock = [100.0]
+        monkeypatch.setattr(client.time, "monotonic", lambda: clock[0])
+        cfg = config(
+            enable_control=True,
+            enable_dagger=dagger,
+            control_token="x" * 16 if dagger else "",
+        )
+        node = ros.create(cfg)
+        if dagger:
+            send_state(node, ros)
+        q = np.asarray(client.DEFAULT_JOINT_POSITIONS)
+        q[14:] = [0.13, 0.27, 0.39]
+        node._reset_complete = node._received_action_chunk = True
+        node.limiter.reset(q[:14])
+        action = np.r_[q[:7], closure, q[7:14], 0.6]
+        node._native_actions = action[None, :].copy()
+        node._native_started = clock[0]
+        for tick in range(1, 11):
+            clock[0] += 0.01
+            node.now_ns += 10_000_000
+            state = ros.Message()
+            state.name, state.position = list(CONTROL_JOINT_NAMES), q.tolist()
+            state.header.stamp = node.get_clock().now().to_msg()
+            node._on_joints(state)
+            node._control_tick()
+            assert node.fault is None
+            combined = node.publishers[cfg.joint_command_topic].messages[-1]
+            assert combined.name == list(CONTROL_JOINT_NAMES) + [
+                "R_ban",
+                "L_ban",
+            ]
+            # Preserve all existing arm and measured-waist command values.
+            np.testing.assert_array_equal(combined.position[:17], q)
+            expected = np.minimum(
+                np.clip([closure, 0.6], 0, 1) * 1.5707, tick * 0.035
+            )
+            np.testing.assert_allclose(combined.position[17:], expected)
+            for side, value, topic, label in (
+                ("right", closure, cfg.right_hand_topic, "R_ban"),
+                ("left", 0.6, cfg.left_hand_topic, "L_ban"),
+            ):
+                names, positions = client.hand_command(side, value)
+                hand = node.publishers[topic].messages[-1]
+                assert hand.name == [*names, label]
+                np.testing.assert_array_equal(hand.position[:10], positions)
+                assert hand.position[-1] == float(value >= 0.5)
+                assert hand.header.stamp.sec == combined.header.stamp.sec
+                assert (
+                    hand.header.stamp.nanosec == combined.header.stamp.nanosec
+                )
+        np.testing.assert_array_equal(node._native_actions[0], action)
+
+    def test_missing_model_action_does_not_invent_gripper_fields(
+        self, config, ros
+    ):
+        node = ros.create(config(enable_control=True))
+        node._reset_complete = True
+        feedback(node, ros)
+        node._control_tick()
+        assert all(not pub.messages for pub in node.publishers.values())
 
 
 @pytest.mark.parametrize("reset_complete", [False, True])
