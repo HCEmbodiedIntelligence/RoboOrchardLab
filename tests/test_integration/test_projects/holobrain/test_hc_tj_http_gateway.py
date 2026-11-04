@@ -222,7 +222,7 @@ class TestHttpClientBoundary:
         monkeypatch.setattr(
             http_client,
             "_build_request",
-            lambda *_args: ({}, {}, None),
+            lambda *_args: ({}, {}),
         )
         monkeypatch.setattr(
             http_client,
@@ -292,7 +292,7 @@ class TestHttpClientBoundary:
         monkeypatch.setattr(
             http_client,
             "_build_request",
-            lambda *_args: ({}, {}, None),
+            lambda *_args: ({}, {}),
         )
         monkeypatch.setattr(
             http_client,

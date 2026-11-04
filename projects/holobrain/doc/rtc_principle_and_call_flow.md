@@ -70,13 +70,16 @@ i >= H：保持原始新预测
 ## 一次请求从机器人到模型再回来
 
 1. **客户端继续执行旧轨迹。** HC-TJ ROS 客户端以默认 100 Hz 运行控制定时器，
-   推理定时器每 20 ms 检查一次；推理请求交给单线程 worker，未完成时不会再发新
-   请求。到达设定的推理频率后，它按旧 chunk 的起始时间和 30 Hz 去掉已经过期的
-   动作，得到 `remaining_actions`；根据往返耗时的指数滑动平均估计
+   推理定时器每 20 ms 检查一次；图像解码、打包和 HTTP 请求交给后台 worker。
+   可执行推理最多一个在途；DAgger 暂停时可另有一个服务端抑制的观测请求，结果
+   不进入执行轨迹。到达设定的推理频率后，它按旧 chunk 的单调时钟起点，从当前
+   分数相位以 30 Hz 采样 `remaining_actions`；根据包含预处理和响应轮询等待的
+   端到端耗时的指数滑动平均估计
    `delay_horizon`。见 [`_remaining_actions`、`_inference_tick`](../scripts/hc_tj_async_client.py)。
 2. **HTTP 请求传递原生动作。** 客户端用 multipart `.npy` 上传观测和可选的
-   `remaining_actions [N,16]`，以表单字段传 `delay_horizon`。此时旧动作保持
-   **30 Hz**，没有先插值到 100 Hz。见 [`_build_request`](../scripts/hc_tj_async_client.py)。
+   `remaining_actions [N,16]`，以表单字段传 `delay_horizon`。旧动作采样间隔保持
+   **30 Hz**，首点对齐请求快照时刻，不量化到整步。见
+   [`_build_request`](../scripts/hc_tj_async_client.py)。
 3. **服务端校验并装配模型输入。** `/{server_name}/hc_tj_async/v1` 解码和校验
    请求，把旧动作加一个 batch 维，放入 `MultiArmManipulationInput`。若携带旧动作
    而已加载的 decoder 没有 `RTCInferencePlugin`，服务端直接返回协议错误；共享
@@ -97,8 +100,8 @@ i >= H：保持原始新预测
    [`HoloBrainActionDecoder.forward`](../../../robo_orchard_lab/models/holobrain/action_decoder.py)。
 6. **输出再回到物理关节单位。** decoder 后处理将关节位置反归一化；processor
    取第一条轨迹的关节通道，得到 `[T,J]`。HC-TJ v1 服务端返回 30 Hz、16 维
-   `actions`，不做插值。客户端收到响应后，按**本次真实 HTTP 耗时**再次删除
-   已过期的新动作，检查首点相对当前反馈的跳变，再插值至控制频率执行。见
+   `actions`，不做插值。客户端收到响应后，按**本次端到端耗时**定位执行相位，
+   检查该位置相对当前反馈的跳变，再按单调时钟在控制回调中插值取样。见
    [`post_process`](../../../robo_orchard_lab/models/holobrain/processor.py)、
    [`_infer_hc_tj_async`](../scripts/inference_server.py)、
    [`_inference_tick`](../scripts/hc_tj_async_client.py)。
@@ -110,7 +113,7 @@ ROS 观测/旧动作 → hc_tj_async_client._build_request → HTTP v1
 → inference_server._decode_hc_tj_async_request → pipeline
 → HoloBrainProcessor.pre_process → HoloBrain_Qwen2_5_VL.forward/predict/_forward
 → HoloBrainActionDecoder.forward → RTCInferencePlugin.forward（每个去噪步）
-→ decoder/processor 后处理 → HTTP actions → 客户端裁掉过期步、插值、限速执行
+→ decoder/processor 后处理 → HTTP actions → 客户端按时间取样、限速、限加速度执行
 ```
 
 ## 时序例子：为什么还要在客户端“裁掉过期步”
@@ -118,14 +121,17 @@ ROS 观测/旧动作 → hc_tj_async_client._build_request → HTTP v1
 假设旧 chunk 还剩 24 步，客户端估计一次请求耗时 0.20 秒。30 Hz 下
 `delay_horizon = ceil(0.20 × 30) = 6`。请求发出后，机器人仍在执行旧动作；
 模型生成新 chunk 时，前 6 步由旧动作保护，后面渐变。如果响应实际耗时
-0.23 秒，客户端会从返回的新 chunk 中删除 `floor(0.23 × 30) = 6` 个已经
-过时的步，然后执行余下部分。由此可以区分两个机制：
+0.23 秒，客户端会跳过已经过时的参考时间，从第 6、7 点之间的 0.9 分数位置
+开始取样，而不是从第 6 点重置计时。由此可以区分两个机制：
 
 - RTC 的 `delay_horizon` 是**提前估计**，用于模型内交接；
-- `trim_elapsed_actions` 使用**实际耗时**，用于客户端确定现在还能执行哪些步。
+- 客户端使用**实际耗时**确定剩余时长，并按同一单调时钟在控制和 RTC 路径取样。
+  DAgger 恢复后的首段仍从点零开始，但缩短尾部、拒绝过期观测。
 
 两者都按模型原生 30 Hz 计算。估计不准时，融合不能独自保证首点安全；客户端
-仍会检查相对反馈的首点跳变，并在 100 Hz 控制侧限位、限速。相关实现分别在
+仍会检查相对反馈的首点跳变，并在 100 Hz 控制侧限位、限速和限加速度。正常
+换段保留上一条指令的位置和速度；首次启动、控制窗口失效后恢复才按反馈初始化。
+RTC 回传的是参考轨迹，限速后的实际运动仍通过关节反馈进入模型。相关实现分别在
 [`hc_tj_async_core.py`](../scripts/hc_tj_async_core.py) 和
 [`hc_tj_async_client.py`](../scripts/hc_tj_async_client.py)。
 
@@ -136,10 +142,10 @@ ROS 观测/旧动作 → hc_tj_async_client._build_request → HTTP v1
 - **配置插件不等于每次必用。** `async_inference_plugin` 被构建在 decoder 上；
   只有请求同时提供 `remaining_actions`、`delay_horizon` 才调用。`max_horizon`
   限制融合窗口，不是模型预测步数，也不是控制频率。
-- **当前配置需要核验。** `config_holobrain_qwen_common.py` 使用
+- **导出配置需要核验。** `config_holobrain_qwen_common.py` 使用
   `config.get("async_inference_plugin")` 构建 decoder；当前
-  `config_holobrain_qwen_hc_tj.py` 没有显式设置该字段。因此仅凭该配置文件名
-  不能断言导出的模型已启用 RTC。部署前检查导出目录中的
+  `config_holobrain_qwen_hc_tj.py` 显式配置了 `RTCInferencePlugin`，但已有导出
+  模型可能使用旧配置。部署前检查导出目录中的
   `model/model.config.json`，确认 decoder 内有
   `robo_orchard_lab.models.rtc_plugin.rtc_plugin:RTCInferencePlugin`；
   可按[HC-TJ 部署文档](hc_tj_async_real_robot_deployment.md)提供的配置启用。
