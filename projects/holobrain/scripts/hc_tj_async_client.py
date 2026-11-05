@@ -668,20 +668,7 @@ def _ros_node_class():
             now = time.monotonic()
             elapsed = max(now - self._diagnostic_time, 1e-6)
             counts = self._diagnostic_counts.copy()
-            counts.update(
-                position_clipped=self.limiter.position_clipped,
-                velocity_clipped=self.limiter.velocity_clipped,
-            )
             delta = counts - self._diagnostic_previous
-            if delta["position_clipped"] or delta["velocity_clipped"]:
-                self.get_logger().warning(
-                    "\033[31m[动作超限] "
-                    f"最近 {elapsed:.2f} 秒内："
-                    f"关节位置限幅 {delta['position_clipped']} 次，"
-                    f"速度/加速度/步长限幅 {delta['velocity_clipped']} 次，"
-                    f"最大限幅量 {self.limiter.max_clip_rad:.6f} 弧度。"
-                    "\033[0m"
-                )
             state = self._gate.snapshot() if self.config.enable_dagger else {}
             if self._authority_events:
                 self.get_logger().info(
@@ -1404,6 +1391,18 @@ def _ros_node_class():
                         message.name, message.position = list(names), positions
                         self._motion_publishers[topic].publish(message)
                 else:
+                    # 补手部动作
+                    joint_message.name.append("R_ban")
+                    joint_message.name.append("L_ban")
+                    fake_r_eef_command=float(
+                        np.clip(action[7], 0, 1)
+                    ) if action is not None else self._right_hand_observation
+                    fake_l_eef_command=float(
+                        np.clip(action[15], 0, 1)
+                    ) if action is not None else self._left_hand_observation
+
+                    joint_message.position.append(fake_r_eef_command)
+                    joint_message.position.append(fake_l_eef_command)
                     self._joint_publisher.publish(joint_message)
                 published = time.monotonic()
                 if self._last_publish_time is not None:
