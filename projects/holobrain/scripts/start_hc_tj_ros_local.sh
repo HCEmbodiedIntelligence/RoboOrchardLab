@@ -119,7 +119,7 @@ echo "[local-launcher] 客户端频率、限速与抢占日志: ${CLIENT_LOG}"
   --urdf-path "${URDF_PATH}" \
   --depth-units-per-meter "${HC_TJ_DEPTH_UNITS_PER_METER:-1000}" \
   --control-token "${HC_TJ_CONTROL_TOKEN}" \
-  --inference-hz "${HC_TJ_INFERENCE_HZ:-20.0}" \
+  --inference-hz "${HC_TJ_INFERENCE_HZ:-15.0}" \
   --control-hz "${HC_TJ_CONTROL_HZ:-100.0}" \
   --color-topic /observation/cameras/head/color/compressed \
   --depth-topic /observation/cameras/head/depth/compressed \
@@ -131,7 +131,7 @@ echo "[local-launcher] 客户端频率、限速与抢占日志: ${CLIENT_LOG}"
   --joint-command-topic /hc_teleop/joint_cmd \
   --right-hand-topic /hc_teleop/joint_cmd_finger_right \
   --left-hand-topic /hc_teleop/joint_cmd_finger_left \
-  --first-point-jump-rad "${HC_TJ_FIRST_POINT_JUMP_RAD:-0.70}" \
+  --first-point-jump-rad "${HC_TJ_FIRST_POINT_JUMP_RAD:-0.60}" \
   --state-timeout-s "${HC_TJ_STATE_TIMEOUT_S:-0.6}" \
   --enable-dagger \
   --enable-control 2>&1 | tee "${CLIENT_LOG}"
