@@ -55,3 +55,19 @@ cd ~/workspace/RoboOrchardLab
 
 模型可以在未授权时持续计算，但动作只有在 Dashboard 开启程序控制、所有权状态为
 `AUTO/grant/motion` 且控制心跳有效时才会送入中间件。启动和重连不会自动授权。
+
+legacy 客户端通过 `/hc_teleop/joint_cmd_finger_right` 和对应的左手话题，
+分别发送该手 10 个手指关节的位置目标。开启 DAgger 时，每条右手命令再追加
+`R_ban`，每条左手命令再追加 `L_ban`，形成各侧 11 项消息。标签按模型开合量
+`>= 0.5` 记为 1，否则记为 0，与 `convert_hc_tj_mcap.py` 的手部输入格式一致。
+此修改适用于重启客户端后新录制的数据。
+
+启动脚本的 `runtime/holobrain_ros/client_*.log`
+每秒输出一次 `[motion-diag]`。`counts.right_hand_close_ticks` 和
+`counts.left_hand_close_ticks` 分别统计这一秒内开合量达到 0.5 且成功发布的手部命令数；
+缺省表示 0。实际执行情况可对照同一时段 HC 仲裁后的 `/action/right_hand/joint_states`
+和实测反馈 `/observation/hands/joint_states`。
+
+双手的 `R_ban`、`L_ban` 可在 `/action/joint_states` 中按名字查看。若 MCAP
+要求在同一条右手消息中保存两个开合标签，应在录制器按时间戳合并左右手标签，
+只修改写入 MCAP 的消息副本。

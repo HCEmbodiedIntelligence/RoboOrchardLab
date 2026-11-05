@@ -1389,6 +1389,18 @@ def _ros_node_class():
                         message = JointState()
                         message.header.stamp = stamp
                         message.name, message.position = list(names), positions
+                        # 补手部动作
+                        message.name.append("R_ban")
+                        message.name.append("L_ban")
+                        fake_r_eef_command=float(
+                            np.clip(action[7], 0, 1)
+                        ) if action is not None else self._right_hand_observation
+                        fake_l_eef_command=float(
+                            np.clip(action[15], 0, 1)
+                        ) if action is not None else self._left_hand_observation
+
+                        message.position.append(fake_r_eef_command)
+                        message.position.append(fake_l_eef_command)
                         self._motion_publishers[topic].publish(message)
                 else:
                     # 补手部动作
@@ -1431,7 +1443,17 @@ def _ros_node_class():
                     hand_message.header.stamp = stamp
                     hand_message.name = list(names)
                     hand_message.position = positions.tolist()
+                    if self.config.enable_dagger:
+                        # Match each recorded hand's binary gripper label.
+                        hand_message.name.append(
+                            "R_ban" if side == "right" else "L_ban"
+                        )
+                        hand_message.position.append(float(closure >= 0.5))
                     publisher.publish(hand_message)
+                    if closure >= 0.5:
+                        self._diagnostic_counts[
+                            f"{side}_hand_close_ticks"
+                        ] += 1
                 with self._lock:
                     # Estimate hand input from the last published command.
                     # This is not measured hand position feedback.

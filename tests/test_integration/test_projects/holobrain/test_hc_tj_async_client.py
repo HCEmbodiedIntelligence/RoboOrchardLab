@@ -744,20 +744,46 @@ class TestStandardGripperFields:
                 np.clip([closure, 0.6], 0, 1) * 1.5707, tick * 0.035
             )
             np.testing.assert_allclose(combined.position[17:], expected)
+        np.testing.assert_array_equal(node._native_actions[0], action)
+
+    @pytest.mark.parametrize("dagger", [True, False])
+    def test_dagger_hand_commands_append_their_own_binary_label(
+        self, config, ros, dagger
+    ):
+        cfg = config(
+            enable_control=True,
+            enable_dagger=dagger,
+            control_token="x" * 16 if dagger else "",
+        )
+        node = ros.create(cfg)
+        if dagger:
+            send_state(node, ros)
+        node._reset_complete = node._received_action_chunk = True
+        q = np.asarray(client.DEFAULT_JOINT_POSITIONS)
+        node.limiter.reset(q[:14])
+        for tick, (right, left) in enumerate([(0, 1), (1, 0), (0.49, 0.5)], 1):
+            node.now_ns += 10_000_000
+            feedback(node, ros)
+            node._native_actions = np.r_[q[:7], right, q[7:14], left][None, :]
+            node._native_started = time.monotonic()
+            node._control_tick()
+            assert node.fault is None
             for side, value, topic, label in (
-                ("right", closure, cfg.right_hand_topic, "R_ban"),
-                ("left", 0.6, cfg.left_hand_topic, "L_ban"),
+                ("right", right, cfg.right_hand_topic, "R_ban"),
+                ("left", left, cfg.left_hand_topic, "L_ban"),
             ):
                 names, positions = client.hand_command(side, value)
-                hand = node.publishers[topic].messages[-1]
-                assert hand.name == [*names, label]
-                np.testing.assert_array_equal(hand.position[:10], positions)
-                assert hand.position[-1] == float(value >= 0.5)
-                assert hand.header.stamp.sec == combined.header.stamp.sec
-                assert (
-                    hand.header.stamp.nanosec == combined.header.stamp.nanosec
-                )
-        np.testing.assert_array_equal(node._native_actions[0], action)
+                messages = node.publishers[topic].messages
+                assert len(messages) == tick
+                hand = messages[-1]
+                assert hand.name == list(names) + ([label] if dagger else [])
+                expected = positions.tolist()
+                if dagger:
+                    expected.append(float(value >= 0.5))
+                np.testing.assert_array_equal(hand.position, expected)
+                assert hand.header.stamp == node.get_clock().now().to_msg()
+        assert node._diagnostic_counts["right_hand_close_ticks"] == 1
+        assert node._diagnostic_counts["left_hand_close_ticks"] == 2
 
     def test_missing_model_action_does_not_invent_gripper_fields(
         self, config, ros
