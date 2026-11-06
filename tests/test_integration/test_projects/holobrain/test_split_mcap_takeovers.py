@@ -131,10 +131,122 @@ class TestSplitMcapTakeovers(unittest.TestCase):
                     split_mcap_takeovers(self.source, self.output)
                 self.assertFalse(self.output.exists())
 
+    def test_camera_state_carries_forward_by_timestamp(self):
+        for prefix in (
+            "/observation/cameras/head",
+            "/io_teleop/camera_head",
+        ):
+            with self.subTest(prefix=prefix):
+                bag = self.root / prefix.strip("/").replace("/", "_")
+                writer = rosbag2_py.SequentialWriter()
+                calibration = f"{prefix}/calibration"
+                extrinsics = f"{prefix}/extrinsics"
+                records = [
+                    (calibration, b"latest", 9),
+                    (calibration, b"older", 5),
+                    (extrinsics, b"pose", 6),
+                    ("/sample", b"frame", 12),
+                    (calibration, b"update", 15),
+                    (calibration, b"boundary", 20),
+                    ("/sample", b"frame2", 21),
+                    (calibration, b"future", 30),
+                ]
+                if prefix.startswith("/observation"):
+                    dynamic_topics = (
+                        f"{prefix}/color/compressed",
+                        f"{prefix}/depth/compressed",
+                        "/observation/joint_states",
+                        "/action/joint_states",
+                        "/action/right_hand/joint_states",
+                        "/action/left_hand/joint_states",
+                    )
+                else:
+                    dynamic_topics = (
+                        f"{prefix}/color",
+                        f"{prefix}/depth",
+                        "io_teleop/joint_states",
+                        "io_teleop/joint_cmd",
+                        "/io_teleop/joint_cmd_finger_right",
+                        "/io_teleop/joint_cmd_finger_left",
+                    )
+                records.extend(
+                    (topic, b"sample", timestamp)
+                    for topic in dynamic_topics
+                    for timestamp in (12, 21)
+                )
+                # A nonempty interval with both hand topics missing is skipped.
+                records.extend(
+                    (topic, b"sample", 27) for topic in dynamic_topics[:-2]
+                )
+                try:
+                    writer.open(
+                        rosbag2_py.StorageOptions(
+                            uri=str(bag), storage_id="mcap"
+                        ),
+                        rosbag2_py.ConverterOptions("", ""),
+                    )
+                    for topic in (
+                        calibration,
+                        extrinsics,
+                        "/sample",
+                        *dynamic_topics,
+                        "/optional/status",
+                    ):
+                        writer.create_topic(
+                            rosbag2_py.TopicMetadata(
+                                id=0,
+                                name=topic,
+                                type="std_msgs/msg/String",
+                                serialization_format="cdr",
+                            )
+                        )
+                    records = [
+                        (
+                            topic,
+                            serialize_message(String(data=data.decode())),
+                            t,
+                        )
+                        for topic, data, t in records
+                    ]
+                    for record in records:
+                        writer.write(*record)
+                finally:
+                    writer.close()
+                next(bag.glob("*.mcap")).replace(self.source / "demo.mcap")
+                self.annotate([(10, 14), (26, 29), (10, 20), (20, 25)])
+                with self.assertLogs(level="WARNING") as logs:
+                    outputs = split_mcap_takeovers(self.source, bag / "output")
+                self.assertEqual(
+                    [p.name for p in outputs],
+                    [f"demo.takeover_{i:04d}.mcap" for i in (1, 3, 4)],
+                )
+                self.assertIn("demo.takeover_0002.mcap", logs.output[0])
+                for topic in dynamic_topics[-2:]:
+                    self.assertIn(topic, logs.output[0])
+                self.assertEqual(set((bag / "output").iterdir()), set(outputs))
+                for target, (start, end) in zip(
+                    outputs, [(10, 14), (10, 20), (20, 25)], strict=True
+                ):
+                    expected = [r for r in records if start <= r[2] < end]
+                    expected.append((extrinsics, records[2][1], start))
+                    if start != 20:
+                        expected.append((calibration, records[0][1], start))
+                    self.assertEqual(_messages(target), sorted(expected))
+                # Seeds alone must not turn an empty interval into an episode.
+                self.annotate([(100, 200)])
+                with self.assertLogs(level="WARNING"):
+                    self.assertEqual(
+                        split_mcap_takeovers(self.source, bag / "empty"), []
+                    )
+                self.assertEqual(list((bag / "empty").iterdir()), [])
+
     def test_empty_segment_cleanup(self):
         self.annotate([(1000, 2000)])
-        with self.assertRaisesRegex(ValueError, "no messages"):
-            split_mcap_takeovers(self.source, self.output)
+        with self.assertLogs(level="WARNING") as logs:
+            self.assertEqual(
+                split_mcap_takeovers(self.source, self.output), []
+            )
+        self.assertIn("/sample", logs.output[0])
         self.assertEqual(list(self.output.iterdir()), [])
 
     def test_write_failure_cleanup(self):
