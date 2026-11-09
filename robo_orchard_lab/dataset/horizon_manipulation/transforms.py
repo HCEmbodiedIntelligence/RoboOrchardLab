@@ -65,7 +65,7 @@ class AddItems:
         self.items = copy.deepcopy(kwargs)
         for k, v in self.items.items():
             if to_numpy and not isinstance(v, np.ndarray):
-                self.items[k] = np.array(v)
+                self.items[k] = np.array(v) if not isinstance(v, (int,float)) else  np.array([v])
 
     def __call__(self, data):
         for k, v in self.items.items():

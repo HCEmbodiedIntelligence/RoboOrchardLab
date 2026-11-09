@@ -538,7 +538,8 @@ class HoloBrain_Qwen2_5_VL_HC_TaskProgress(ModelMixin):  # noqa: N801
 
     A learned trailing query reads the prompt without affecting action tokens.
     ``loss`` accepts optional ``task_progress`` targets in [0, 1], shaped
-    (B,) or (B, 1). ``predict`` adds a scalar ``task_progress`` per sample.
+    (B,) or (B, 1). An optional boolean ``task_progress_mask`` of either
+    shape limits progress supervision to valid samples. ``predict`` adds a scalar ``task_progress`` per sample.
     The query and progress MLP remain trainable when the VLM is frozen.
     Without targets, the progress loss is zero but remains connected for DDP.
     """
@@ -720,17 +721,43 @@ class HoloBrain_Qwen2_5_VL_HC_TaskProgress(ModelMixin):  # noqa: N801
                 raise ValueError(
                     "task_progress must have shape (B,) or (B, 1)"
                 )
+            if "task_progress_mask" in inputs:
+                mask = torch.as_tensor(
+                    inputs["task_progress_mask"], device=progress.device
+                )
+                if mask.shape == (progress.shape[0], 1):
+                    mask = mask.squeeze(-1)
+                if mask.dtype != torch.bool or mask.shape != progress.shape:
+                    raise ValueError(
+                        "task_progress_mask must be boolean with shape "
+                        "(B,) or (B, 1)"
+                    )
+                target, progress = target[mask], progress[mask]
             if not torch.isfinite(target).all() or not (
                 (target >= 0) & (target <= 1)
             ).all():
                 raise ValueError("task_progress must be finite and in [0, 1]")
-            loss["loss_task_progress"] = nn.functional.mse_loss(
-                progress, target
+            loss["loss_task_progress"] = (progress - target).square().sum() / max(
+                1, target.numel()
             )
         else:
             # Keep the head in the backward graph for unlabeled DDP
             # batches.
             loss["loss_task_progress"] = progress.sum() * 0
+
+        if "task_progress_loss_weight" in inputs:
+            weight = torch.as_tensor(
+                inputs["task_progress_loss_weight"],
+                device=progress.device,
+                dtype=torch.float32,
+            )[mask]
+            if weight.shape == (progress.shape[0], 1):
+                weight = weight.squeeze(-1)
+            if weight.shape != progress.shape:
+                raise ValueError(
+                    "task_progress_loss_weight must have shape (B,) or (B, 1)"
+                )
+            loss["loss_task_progress"] *= weight.mean()
         return loss
 
     @torch.no_grad()

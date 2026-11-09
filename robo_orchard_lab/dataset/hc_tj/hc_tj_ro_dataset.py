@@ -45,6 +45,16 @@ _DEFAULT_JOINT_NAMES = (
     "L_ban",
 )
 
+class AddNormTaskProgress:
+    def __init__(self,count_progress:bool=False) -> None:
+        self.count_progress = count_progress
+    def __call__(self, data: dict) -> dict:
+        frame_index = data.get("frame_index")
+        episode_length = data.get("episode").frame_num 
+        task_progress =frame_index/(episode_length-1) if episode_length > 1 else 0.0
+        data["task_progress"] = task_progress
+        data["task_progress_mask"]=self.count_progress
+        return data
 
 class _HcTjArrowDataParse:
     """Decode hc_tj Arrow rows into the existing HoloBrain input contract.

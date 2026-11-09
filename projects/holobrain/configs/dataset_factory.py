@@ -55,6 +55,7 @@ def apply_dataset_register():
     import config_agilex_ro_dataset  # noqa: F401
     import config_hc_tj_ro_dataset  # noqa: F401
     import config_robotwin_dataset  # noqa: F401
+    import config_hc_tj_task_progress_dataset  # noqa: F401
 
     REGISTERED = True
 

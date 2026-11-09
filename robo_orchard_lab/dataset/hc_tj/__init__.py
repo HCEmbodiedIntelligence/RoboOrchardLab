@@ -16,6 +16,9 @@
 
 """hc_tj dataset adapters."""
 
-from robo_orchard_lab.dataset.hc_tj.hc_tj_ro_dataset import HcTjRODataset
+from robo_orchard_lab.dataset.hc_tj.hc_tj_ro_dataset import (
+    HcTjRODataset,
+    AddNormTaskProgress,
+)
 
-__all__ = ["HcTjRODataset"]
+__all__ = ["HcTjRODataset", "AddNormTaskProgress"]

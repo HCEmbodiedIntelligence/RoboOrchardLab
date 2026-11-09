@@ -142,20 +142,20 @@ dataset_config = {
         "joint_scale_shift": _joint_scale_shift_from_urdf(_URDF_PATH),
         "T_base2world": _base_to_zhi_from_zero_pose(_URDF_PATH),
     },
-    "dev_test": {
-        "data_paths": [
-            "/home/hc-em/workspace/workspaces/RoboOrchardLab/projects/holobrain/data/arrow_dataset/hc_tj_261026"
-        ],
-        "urdf": str(_URDF_PATH),
-        "cam_names": ["head"],
-        "joint_names": tuple(
-            _ARM_JOINT_NAMES[:7] + ["R_ban"] + _ARM_JOINT_NAMES[7:] + ["L_ban"]
-        ),
-        "finger_keys": [["R_ban_Link"], ["L_ban_Link"]],
-        "has_grippers": True,
-        "joint_scale_shift": _joint_scale_shift_from_urdf(_URDF_PATH),
-        "T_base2world": _base_to_zhi_from_zero_pose(_URDF_PATH),
-    },
+    # "dev_test": {
+    #     "data_paths": [
+    #         "/home/hc-em/workspace/workspaces/RoboOrchardLab/projects/holobrain/data/arrow_dataset/grasp_red_snack"
+    #     ],
+    #     "urdf": str(_URDF_PATH),
+    #     "cam_names": ["head"],
+    #     "joint_names": tuple(
+    #         _ARM_JOINT_NAMES[:7] + ["R_ban"] + _ARM_JOINT_NAMES[7:] + ["L_ban"]
+    #     ),
+    #     "finger_keys": [["R_ban_Link"], ["L_ban_Link"]],
+    #     "has_grippers": True,
+    #     "joint_scale_shift": _joint_scale_shift_from_urdf(_URDF_PATH),
+    #     "T_base2world": _base_to_zhi_from_zero_pose(_URDF_PATH),
+    # },
     "hc_tj_14dof": {
         "data_paths": [str(_ARM_ONLY_DATASET_PATH)],
         "urdf": str(_URDF_PATH),
@@ -406,7 +406,6 @@ def build_datasets(config, dataset_names, mode, **kwargs):
     from robo_orchard_lab.utils.build import build
     from robo_orchard_lab.utils.misc import as_sequence
 
-
     datasets = []
     for dataset_name, data_config in dataset_config.items():
         if dataset_name not in dataset_names:
@@ -416,7 +415,7 @@ def build_datasets(config, dataset_names, mode, **kwargs):
                 logging.warning(
                     "Warning: 'urdf' will be ignored in hc_tj dataset config. Use the registered dataset config instead."
                 )
-                urdf_path=kwargs.pop("urdf")
+                urdf_path = kwargs.pop("urdf")
                 joint_scale_shift = _joint_scale_shift_from_urdf(urdf_path)
                 T_base2world = _base_to_zhi_from_zero_pose(urdf_path)
                 data_config["joint_scale_shift"] = joint_scale_shift
@@ -429,8 +428,10 @@ def build_datasets(config, dataset_names, mode, **kwargs):
         paths = _expand_ro_data_paths(data_config["data_paths"])
         if not paths:
             raise FileNotFoundError(
-                "hc_tj RODataset was not found. Run "
-                "scripts/convert_hc_tj_mcap.py first."
+                "hc_tj RODataset was not found. Check {} and run "
+                "scripts/convert_hc_tj_mcap.py first.".format(
+                    data_config["data_paths"]
+                )
             )
         transforms = build_transforms(config, mode, data_config)
         dataset = HcTjRODataset(

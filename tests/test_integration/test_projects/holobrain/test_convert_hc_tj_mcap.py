@@ -52,6 +52,7 @@ from projects.holobrain.scripts.replay_hc_tj_mcap_urdf import (
     _load_joint_samples,
     _source_joint_config,
 )
+from robo_orchard_lab.dataset.hc_tj import HcTjRODataset
 from robo_orchard_lab.dataset.robot import RODataset
 from robo_orchard_lab.dataset.robot.db_orm import Episode
 
@@ -533,6 +534,16 @@ def test_mcap_directory_converts_to_multi_episode_dataset(
         0,
         1,
     ]
+
+    clip_dir = tmp_path / "synthetic_only_human"
+    clip_dir.symlink_to(output, target_is_directory=True)
+    hc_dataset = HcTjRODataset([str(output), str(clip_dir)], 2, 3)
+    samples = hc_dataset.__getitems__([1, 2, 5, 6])
+    assert [x["task_progress"] for x in samples] == [1.0, 0.0, 1.0, 0.0]
+    assert [x["task_progress_mask"] for x in samples] == [True] * 2 + [
+        False
+    ] * 2
+    assert hc_dataset[5]["task_progress_mask"] is False
 
 
 def test_empty_mcap_directory_is_rejected(tmp_path: Path) -> None:
