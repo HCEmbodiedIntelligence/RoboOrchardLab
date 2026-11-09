@@ -471,7 +471,7 @@ class HookBasedTrainer:
 
         if resume_from is not None:
             logger.info(f"Resume from: {resume_from}", main_process_only=True)
-            resume_from.load_state(accelerator=self.accelerator)
+            resume_from.load_state(accelerator=self.accelerator,map_location="cpu")
             self._start_epoch = self.trainer_progress_state.epoch_id
             self._start_step = self.trainer_progress_state.step_id
 

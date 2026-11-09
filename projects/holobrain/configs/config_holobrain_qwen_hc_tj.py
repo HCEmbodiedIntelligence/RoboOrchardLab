@@ -41,8 +41,8 @@ __all__ = [
 
 config = copy.deepcopy(_common_config)
 config.update(
-    training_datasets=["hc_tj","hc_tj_1020_test"],
-    deploy_datasets=["hc_tj"],
+    training_datasets=["dev_test"],
+    deploy_datasets=["dev_test"],
     batch_size=1,
     step_log_freq=50,
     save_step_freq=5000,
@@ -52,9 +52,8 @@ config.update(
     warmup_steps=300,
     decay_steps=int(1e5),
     decay_lr=2.5e-6,
-    dataset_sample_weights=[5,1]
 )
-config["async_inference_plugin"]=={
+config["async_inference_plugin"]={
         "type": (
             "robo_orchard_lab.models.rtc_plugin.rtc_plugin:RTCInferencePlugin"
         ),

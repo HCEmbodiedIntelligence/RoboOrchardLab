@@ -142,6 +142,20 @@ dataset_config = {
         "joint_scale_shift": _joint_scale_shift_from_urdf(_URDF_PATH),
         "T_base2world": _base_to_zhi_from_zero_pose(_URDF_PATH),
     },
+    "dev_test": {
+        "data_paths": [
+            "/home/hc-em/workspace/workspaces/RoboOrchardLab/projects/holobrain/data/arrow_dataset/hc_tj_261026"
+        ],
+        "urdf": str(_URDF_PATH),
+        "cam_names": ["head"],
+        "joint_names": tuple(
+            _ARM_JOINT_NAMES[:7] + ["R_ban"] + _ARM_JOINT_NAMES[7:] + ["L_ban"]
+        ),
+        "finger_keys": [["R_ban_Link"], ["L_ban_Link"]],
+        "has_grippers": True,
+        "joint_scale_shift": _joint_scale_shift_from_urdf(_URDF_PATH),
+        "T_base2world": _base_to_zhi_from_zero_pose(_URDF_PATH),
+    },
     "hc_tj_14dof": {
         "data_paths": [str(_ARM_ONLY_DATASET_PATH)],
         "urdf": str(_URDF_PATH),

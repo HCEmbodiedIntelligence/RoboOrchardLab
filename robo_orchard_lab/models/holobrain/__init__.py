@@ -42,6 +42,8 @@ from .robot_state_encoder import (
 )
 from .structure import (
     HoloBrain_Qwen2_5_VL,
+    HoloBrain_Qwen2_5_VL_HC_TaskProgress,
+    HoloBrain_Qwen2_5_VL_HC_TaskProgressConfig,
     HoloBrain_Qwen2_5_VLConfig,
     TextTemplate,
 )
