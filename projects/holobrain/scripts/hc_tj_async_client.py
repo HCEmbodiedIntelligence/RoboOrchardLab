@@ -77,6 +77,10 @@ __all__ = [
 ]
 
 
+class _FeedbackTimingError(ValueError):
+    """Timing violation requiring stable feedback and fresh human authority."""
+
+
 # Positions follow CONTROL_JOINT_NAMES: both 7-axis arms, then leg_1,
 # leg_2, and zhi. Hands are commanded by their dedicated publishers.
 DEFAULT_JOINT_POSITIONS = (
@@ -523,6 +527,11 @@ def _ros_node_class():
             self._right_hand_observation = 0.0
             self._left_hand_observation = 0.0
             self._fault: str | None = None
+            self._feedback_pause: str | None = None
+            self._feedback_stable_since: float | None = None
+            self._feedback_last_good: tuple[int, float] | None = None
+            self._feedback_manual_grant: tuple[str, str, int] | None = None
+            self._feedback_timing: dict[str, Any] = {}
             self._reset_complete = (
                 not config.enable_control
                 or config.enable_dagger
@@ -702,6 +711,15 @@ def _ros_node_class():
                         "inference_wait": self._inference_wait,
                         "control_wait": self._control_wait,
                         "fault": self.fault,
+                        "feedback_pause": self._feedback_pause,
+                        "feedback_timing": self._feedback_timing,
+                        "feedback_stable_s": (
+                            round(now - self._feedback_stable_since, 3)
+                            if self._feedback_stable_since is not None
+                            else 0
+                        ),
+                        "feedback_manual_seen": self._feedback_manual_grant
+                        is not None,
                         "request_ms": round(self._request_elapsed_ms, 2),
                         "inflight_age_ms": round(
                             (now - self._future_started) * 1000, 2
@@ -851,10 +869,68 @@ def _ros_node_class():
 
         def _on_ownership(self, message: Any) -> None:
             try:
-                self._gate.update_ownership(
-                    json.loads(message.data),
-                    self.get_clock().now().nanoseconds,
-                )
+                with self._gate.lock:
+                    data = json.loads(message.data)
+                    self._gate.update_ownership(
+                        data,
+                        self.get_clock().now().nanoseconds,
+                    )
+                    if self._feedback_pause is not None:
+                        self._poll_feedback_recovery()
+                        state = self._gate.snapshot()
+                        owner = state["ownership"]
+                        stable = (
+                            self._feedback_stable_since is not None
+                            and time.monotonic() - self._feedback_stable_since
+                            >= 1.0
+                        )
+                        # Use only the snapshot actually accepted by the gate,
+                        # never an out-of-order or stale incoming message.
+                        fresh = (
+                            owner.get("sequence") == data.get("sequence")
+                            and -0.05
+                            <= (
+                                self.get_clock().now().nanoseconds
+                                - data["published_stamp_ns"]
+                            )
+                            * 1e-9
+                            <= self._gate.timeout_s
+                            and all(
+                                owner.get(k) == data.get(k)
+                                for k in (
+                                    "controller_instance_id",
+                                    "session_id",
+                                    "epoch",
+                                    "state",
+                                )
+                            )
+                        )
+                        if stable and fresh and owner.get("state") == "MANUAL":
+                            self._feedback_manual_grant = (
+                                owner["controller_instance_id"],
+                                owner["session_id"],
+                                owner["epoch"],
+                            )
+                        manual = self._feedback_manual_grant
+                        if (
+                            stable
+                            and fresh
+                            and state["allowed"]
+                            and manual
+                            and (
+                                owner["controller_instance_id"] == manual[0]
+                                and owner["session_id"] == manual[1]
+                                and owner["epoch"] > manual[2]
+                            )
+                        ):
+                            self._feedback_pause = None
+                            self._feedback_manual_grant = None
+                            self._diagnostic_counts["feedback_rearmed"] += 1
+                            self.get_logger().info(
+                                "Feedback recovered; manual-to-AUTO accepted; "
+                                "waiting for fresh observations and actions"
+                            )
+                        self._gate.invalidate("feedback_recovery")
             except (ValueError, TypeError, KeyError):
                 self._gate.invalidate("invalid ownership state")
             self._sync_control()
@@ -997,23 +1073,85 @@ def _ros_node_class():
 
         def _check_feedback_freshness(self, sample: TimedValue) -> None:
             """Reject stalled delivery and queued old control feedback."""
-            if _state_is_stale(
-                time.monotonic(),
-                sample.received_monotonic_s,
-                self.config.state_timeout_s,
-            ):
-                raise ValueError("joint feedback is stale")
+            now_ns = self.get_clock().now().nanoseconds
+            receive_age = time.monotonic() - sample.received_monotonic_s
+            age = (now_ns - sample.timestamp_ns) * 1e-9
+            self._feedback_timing = dict(
+                source_age_ms=round(age * 1000, 3),
+                receive_age_ms=round(receive_age * 1000, 3),
+                source_stamp_ns=sample.timestamp_ns,
+                client_now_ns=now_ns,
+                max_age_ms=self.config.state_timeout_s * 1000,
+                max_future_ms=50,
+            )
+            detail = json.dumps(self._feedback_timing)
+            if receive_age > self.config.state_timeout_s:
+                raise _FeedbackTimingError(
+                    "joint feedback is stale: " + detail
+                )
             if self.config.enable_control:
                 # A DDS sample can reach its callback long after publication.
                 # All control backends require synchronized robot/client ROS
                 # clocks, including legacy reset and limiter reseeding.
-                age = (
-                    self.get_clock().now().nanoseconds - sample.timestamp_ns
-                ) * 1e-9
                 if not -0.05 <= age <= self.config.state_timeout_s:
-                    raise ValueError("joint feedback source stamp is stale")
+                    reason = "future" if age < -0.05 else "old"
+                    raise _FeedbackTimingError(
+                        f"joint feedback source stamp is stale ({reason}): "
+                        + detail
+                    )
+
+        def _pause_feedback(self, error: _FeedbackTimingError) -> None:
+            """Stop DAgger without weakening permanent non-timing faults."""
+            if not self.config.enable_dagger:
+                self._latch_fault(f"control safety failure: {error}")
+                return
+            with self._gate.lock, self._lock:
+                self._feedback_pause = str(error)
+                self._feedback_stable_since = None
+                self._feedback_last_good = None
+                self._feedback_manual_grant = None
+                self._gate.invalidate("feedback_timing")
+                self._sync_control()
+                self._clear_trajectory()
+                # Keep the worker bounded, but make even an already-completed
+                # pre-fault response unusable when it is eventually drained.
+                self._future_window = ""
+                self._diagnostic_counts["feedback_pauses"] += 1
+                self.get_logger().error(
+                    f"Feedback paused: {error}; require 1 s stable feedback, "
+                    "then manual takeover and release to AUTO"
+                )
+
+        def _poll_feedback_recovery(self) -> None:
+            """Require a progressing stream, not repeated reads of a sample."""
+            now = time.monotonic()
+            try:
+                sample = self.observations.latest_joints()
+                self._check_feedback_freshness(sample)
+            except ValueError:
+                self._feedback_stable_since = None
+                self._feedback_last_good = None
+                self._feedback_manual_grant = None
+                return
+            previous = self._feedback_last_good
+            if previous is not None and sample.timestamp_ns == previous[0]:
+                if now - previous[1] > 0.1:
+                    self._feedback_stable_since = None
+                    self._feedback_manual_grant = None
+                return
+            if (
+                previous is None
+                or sample.timestamp_ns < previous[0]
+                or now - previous[1] > 0.1
+            ):
+                self._feedback_stable_since = now
+                self._feedback_manual_grant = None
+            self._feedback_last_good = (sample.timestamp_ns, now)
 
         def _inference_tick(self) -> None:
+            if self._feedback_pause is not None:
+                self._inference_wait = "feedback_recovery_requires_manual"
+                return
             self._inference_wait = "fault" if self.fault else "ready"
             if self.fault is not None:
                 return
@@ -1128,6 +1266,9 @@ def _ros_node_class():
                             self._received_action_chunk = True
                             self._jump_rejections = 0
                             self._diagnostic_counts["chunks_accepted"] += 1
+                except _FeedbackTimingError as error:
+                    self._pause_feedback(error)
+                    return
                 except ActionDiscontinuityError as error:
                     self._reject_action_jump(future_window, error)
                     return
@@ -1283,6 +1424,10 @@ def _ros_node_class():
             # Permission invalidation and final arm/hand publication share this
             # lock, including the legacy initial posture branch.
             with self._gate.lock:
+                if self._feedback_pause is not None:
+                    self._poll_feedback_recovery()
+                    self._control_wait = "feedback_recovery_requires_manual"
+                    return
                 if self.config.enable_dagger:
                     state = self._sync_control()
                     if not state["allowed"] or not self._relay.ready(
@@ -1465,6 +1610,8 @@ def _ros_node_class():
                     self._left_hand_observation = float(
                         np.clip(action[15], 0, 1)
                     )
+            except _FeedbackTimingError as error:
+                self._pause_feedback(error)
             except Exception as error:
                 self._latch_fault(f"control safety failure: {error}")
 

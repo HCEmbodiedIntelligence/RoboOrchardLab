@@ -477,6 +477,167 @@ def feedback(node, ros, names=CONTROL_JOINT_NAMES):
     node._on_joints(msg)
 
 
+class TestFeedbackRecovery:
+    def test_delivery_stall_stops_both_paths(self, config, ros, monkeypatch):
+        clock = [100.0]
+        monkeypatch.setattr(client.time, "monotonic", lambda: clock[0])
+        node = ros.create(
+            config(
+                enable_control=True,
+                enable_dagger=True,
+                control_token="x" * 16,
+            )
+        )
+        send_state(node, ros)
+        feedback(node, ros)
+        node._received_action_chunk = True
+        node._native_actions = np.zeros((12, 16))
+        clock[0] += 0.3
+        node._control_tick()
+        node._inference_tick()
+        assert node.fault is None
+        assert "joint feedback is stale:" in node._feedback_pause
+        assert node._feedback_timing["source_age_ms"] == 0
+        assert node._feedback_timing["receive_age_ms"] == 300
+        assert node._native_actions is None
+        assert node._inference_wait == "feedback_recovery_requires_manual"
+        assert all(not pub.messages for pub in node.publishers.values())
+
+    @pytest.mark.parametrize("source_age", [0.7, -0.06])
+    def test_timing_pause_requires_stable_then_manual_auto(
+        self, config, ros, monkeypatch, source_age
+    ):
+        clock = [100.0]
+        monkeypatch.setattr(client.time, "monotonic", lambda: clock[0])
+        node = ros.create(
+            config(
+                enable_control=True,
+                enable_dagger=True,
+                control_token="x" * 16,
+                state_timeout_s=0.6,
+            )
+        )
+        send_state(node, ros)
+        feedback(node, ros)
+        q = np.array(client.DEFAULT_JOINT_POSITIONS)
+        chunk = np.tile(np.r_[q[:7], 0, q[7:14], 0], (12, 1))
+        node._native_actions = chunk
+        node._native_started = clock[0]
+        node._received_action_chunk = True
+        old = Future()
+        node._future = old
+        node._future_window = node._control_window
+        node.now_ns += int(source_age * 1e9)
+        node._control_tick()
+        assert node.fault is None
+        assert node._feedback_pause is not None
+        assert node._feedback_timing["source_age_ms"] == pytest.approx(
+            source_age * 1000
+        )
+        assert node._feedback_timing["receive_age_ms"] == 0
+        assert node._native_actions is None
+        assert not node._received_action_chunk
+        assert node._latency_ewma is None
+        old.set_result((chunk, 0.01))
+
+        # An early manual/new AUTO grant cannot be banked for later recovery.
+        node.now_ns += 1_000_000
+        send_state(node, ros, "MANUAL", 2)
+        node.now_ns += 1_000_000
+        send_state(node, ros, "AUTO", 3)
+        for _ in range(60):
+            clock[0] += 0.02
+            node.now_ns += 20_000_000
+            feedback(node, ros)
+            send_state(node, ros, "AUTO", 3)
+            node._control_tick()
+            node._inference_tick()
+        assert node._feedback_pause is not None
+        assert not node._diagnostic_counts["chunks_accepted"]
+        assert all(not pub.messages for pub in node.publishers.values())
+
+        node.now_ns += 1_000_000
+        send_state(node, ros, "MANUAL", 4)
+        node.now_ns += 1_000_000
+        send_state(node, ros, "AUTO", 5)
+        assert node._feedback_pause is None
+        # Rearm rotates the execution window and requires a new heartbeat.
+        assert not node._gate.snapshot()["allowed"]
+        node.now_ns += 1_000_000
+        send_state(node, ros, "AUTO", 5)
+        node._inference_tick()
+        # Completed pre-fault future is discarded.
+        assert node._native_actions is None
+        assert not node._diagnostic_counts["chunks_accepted"]
+        node.now_ns += 1_000_000
+        feedback(node, ros)
+        node._future = Future()
+        node._future_window = node._control_window
+        node._future_observed_s = clock[0]
+        node._future.set_result((chunk, 0.01))
+        node._inference_tick()
+        node._control_tick()
+        assert node._diagnostic_counts["chunks_accepted"] == 1
+        assert node._diagnostic_counts["limiter_resets"] == 1
+        assert node.publishers[node.config.joint_command_topic].messages
+
+    def test_stalled_or_recurrent_feedback_clears_manual_ack(
+        self, config, ros, monkeypatch
+    ):
+        clock = [100.0]
+        monkeypatch.setattr(client.time, "monotonic", lambda: clock[0])
+        node = ros.create(
+            config(
+                enable_control=True,
+                enable_dagger=True,
+                control_token="x" * 16,
+            )
+        )
+        node._pause_feedback(client._FeedbackTimingError("test timing"))
+        for _ in range(60):
+            clock[0] += 0.02
+            node.now_ns += 20_000_000
+            feedback(node, ros)
+            node._control_tick()
+        node.now_ns += 1_000_000
+        send_state(node, ros, "MANUAL", 2)
+        assert node._feedback_manual_grant is not None
+        # Re-reading one within-timeout sample is not a stable stream.
+        clock[0] += 0.11
+        node._control_tick()
+        assert node._feedback_stable_since is None
+        assert node._feedback_manual_grant is None
+        node.now_ns += 1_000_000
+        send_state(node, ros, "AUTO", 3)
+        assert node._feedback_pause is not None
+        clock[0] += 1
+        node._control_tick()
+        assert node._feedback_timing["receive_age_ms"] > 1000
+        assert all(not pub.messages for pub in node.publishers.values())
+
+    def test_inference_completion_timing_fault_is_recoverable(
+        self, config, ros
+    ):
+        node = ros.create(
+            config(
+                enable_control=True,
+                enable_dagger=True,
+                control_token="x" * 16,
+            )
+        )
+        send_state(node, ros)
+        feedback(node, ros)
+        node.now_ns += 500_000_000
+        node._future = Future()
+        node._future_window = node._control_window
+        node._future_observed_s = time.monotonic()
+        node._future.set_result((np.zeros((8, 16)), 0.01))
+        node._inference_tick()
+        assert node.fault is None
+        assert node._feedback_pause is not None
+        assert node._native_actions is None
+
+
 class TestInferenceRequest:
     @pytest.mark.parametrize("remaining_steps", [None, 0, 2])
     def test_encodes_observation_and_optional_rtc(
