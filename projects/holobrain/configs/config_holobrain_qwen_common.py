@@ -393,7 +393,7 @@ def build_validation_dataset(config, lazy_init=False):
     return build(config, lazy_init)
 
 
-def build_processors(config):
+def build_processors(config,**kwargs):
     from dataset_factory import build_processors as build
 
-    return build(config)
+    return build(config,**kwargs)

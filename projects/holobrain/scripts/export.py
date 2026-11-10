@@ -13,14 +13,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 # implied. See the License for the specific language governing
 # permissions and limitations under the License.
-import debugpy
-try:
-    # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
-    debugpy.listen(("localhost", 9501))
-    print("Waiting for debugger attach")
-    debugpy.wait_for_client()
-except Exception as e:
-    raise e
+# import debugpy
+# try:
+#     # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
+#     debugpy.listen(("localhost", 9501))
+#     print("Waiting for debugger attach")
+#     debugpy.wait_for_client()
+# except Exception as e:
+#     raise e
 
 import argparse
 import json
@@ -29,6 +29,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
+import inspect
 
 
 _REPO_ROOT = os.path.abspath(
@@ -80,7 +81,11 @@ def main(args):
     logger.info("\n" + json.dumps(config, indent=4))
 
     # export data processors and reload test
-    processors = build_processors(config)
+
+    if "urdf" in list(inspect.signature(build_processors).parameters.keys()):
+        processors = build_processors(config, urdf=args.urdf)
+    else:
+        processors = build_processors(config)
     for dataset_name, processor in processors.items():
         processor_name = f"{dataset_name}_processor.json"
         processor.save(args.workspace, processor_name)
@@ -133,6 +138,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str)
     parser.add_argument("--workspace", type=str, default="./workspace")
     parser.add_argument("--kwargs", type=str, default=None)
+    parser.add_argument("--urdf", type=str, default=None)
     args = parser.parse_args()
     log_basic_config(
         format="%(asctime)s %(levelname)s %(filename)s:%(lineno)d | %(message)s",  # noqa: E501

@@ -20,6 +20,7 @@ from __future__ import annotations
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
+import logging
 
 from dataset_factory import (
     processor_register,
@@ -128,7 +129,9 @@ dataset_config = {
         "T_base2world": _base_to_zhi_from_zero_pose(_URDF_PATH),
     },
     "hc_tj_1020_test": {
-        "data_paths": ["/mnt/data/hq_workspace/holobrain/data/hc_tj_261020_test"],
+        "data_paths": [
+            "/mnt/data/hq_workspace/holobrain/data/hc_tj_261020_test"
+        ],
         "urdf": str(_URDF_PATH),
         "cam_names": ["head"],
         "joint_names": tuple(
@@ -380,15 +383,35 @@ def build_transforms(config, mode, data_config):
 @train_dataset_register()
 @validation_dataset_register()
 def build_datasets(config, dataset_names, mode, **kwargs):
-    """Build the registered hc_tj training or validation dataset."""
+    """Build the registered hc_tj training or validation dataset.
+
+    Set config["drop_incomplete_chunks"] to True to exclude sample anchors
+    without a full future chunk. By default, episode tails are padded.
+    """
     from robo_orchard_lab.dataset.hc_tj import HcTjRODataset
     from robo_orchard_lab.utils.build import build
     from robo_orchard_lab.utils.misc import as_sequence
+
 
     datasets = []
     for dataset_name, data_config in dataset_config.items():
         if dataset_name not in dataset_names:
             continue
+        if "urdf" in kwargs:
+            if Path(kwargs["urdf"]).exists():
+                logging.warning(
+                    "Warning: 'urdf' will be ignored in hc_tj dataset config. Use the registered dataset config instead."
+                )
+                urdf_path=kwargs.pop("urdf")
+                joint_scale_shift = _joint_scale_shift_from_urdf(urdf_path)
+                T_base2world = _base_to_zhi_from_zero_pose(urdf_path)
+                data_config["joint_scale_shift"] = joint_scale_shift
+                data_config["T_base2world"] = T_base2world
+                data_config["urdf"] = str(urdf_path)
+            else:
+                logging.warning(
+                    f"Warning: 'urdf' path {kwargs['urdf']} does not exist. Using the registered dataset config instead."
+                )
         paths = _expand_ro_data_paths(data_config["data_paths"])
         if not paths:
             raise FileNotFoundError(
@@ -400,6 +423,7 @@ def build_datasets(config, dataset_names, mode, **kwargs):
             paths=paths,
             hist_steps=config["hist_steps"],
             pred_steps=config["pred_steps"],
+            drop_incomplete_chunks=config.get("drop_incomplete_chunks", False),
             joint_names=data_config["joint_names"],
             transforms=[build(item) for item in as_sequence(transforms)],
         )

@@ -178,6 +178,8 @@ class HcTjRODataset(TorchDataset):
         paths: hc_tj RODataset directories.
         hist_steps: Number of historical state rows per sample.
         pred_steps: Number of future action rows per sample.
+        drop_incomplete_chunks: Exclude anchors without enough future rows.
+            Defaults to False, which repeats the last episode row instead.
         depth_scale: Divisor converting uint16 depth values to meters.
         transforms: HoloBrain transforms applied after hc_tj row decoding.
         joint_names: Ordered joint names expected in the ``joints`` and
@@ -193,6 +195,7 @@ class HcTjRODataset(TorchDataset):
         depth_scale: int = 1000,
         transforms: list[Callable] | None = None,
         joint_names: Sequence[str] = _DEFAULT_JOINT_NAMES,
+        drop_incomplete_chunks: bool = False,
     ) -> None:
         if not paths:
             raise ValueError("hc_tj dataset paths must not be empty")
@@ -203,7 +206,9 @@ class HcTjRODataset(TorchDataset):
             target_columns=["joints", "actions"],
             hist_steps=hist_steps,
             pred_steps=pred_steps,
+            drop_incomplete_chunks=drop_incomplete_chunks,
         )
+        self._dropped_tail_steps = pred_steps if drop_incomplete_chunks else 0
         datasets = [
             ROMultiRowDataset(
                 dataset_path=path,
@@ -232,16 +237,18 @@ class HcTjRODataset(TorchDataset):
         return sum(dataset.episode_num for dataset in self._concat.datasets)
 
     def get_episode_range(self, episode_index: int) -> tuple[int, int]:
-        """Return the concatenated half-open frame range for one episode."""
+        """Return the concatenated half-open sample range for one episode."""
         global_episode = 0
         frame_offset = 0
         for dataset in self._concat.datasets:
             for episode in dataset.iterate_meta(Episode):
+                sample_count = max(
+                    0, episode.frame_num - self._dropped_tail_steps
+                )
                 if global_episode == episode_index:
-                    start = frame_offset + episode.dataset_begin_index
-                    return start, start + episode.frame_num
+                    return frame_offset, frame_offset + sample_count
                 global_episode += 1
-            frame_offset += len(dataset)
+                frame_offset += sample_count
         raise KeyError(f"Episode index {episode_index} not found")
 
     def __len__(self) -> int:
