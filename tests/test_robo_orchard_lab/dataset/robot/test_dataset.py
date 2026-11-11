@@ -24,7 +24,7 @@ from typing import Generator, Iterable
 import datasets as hg_datasets
 import pytest
 import torch
-from sqlalchemy import select
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from robo_orchard_lab.dataset.datatypes import (
@@ -32,6 +32,10 @@ from robo_orchard_lab.dataset.datatypes import (
     BatchJointsState,
 )
 from robo_orchard_lab.dataset.datatypes.geometry import BatchFrameTransform
+from robo_orchard_lab.dataset.horizon_manipulation.row_sampler import (
+    EpisodeChunkSamplerConfig,
+)
+from robo_orchard_lab.dataset.robot.columns import PreservedIndexColumnsKeys
 from robo_orchard_lab.dataset.robot.dataset import (
     ConcatRODataset,
     RODataset,
@@ -1933,6 +1937,130 @@ class TestMultiRowDataset:
         for columns in ["index", "joints"]:
             assert multi_row[0][columns] == dataset[idx_list[0]][columns]
             assert multi_row[1][columns] == dataset[idx_list[1]][columns]
+
+
+class TestMultiRowDatasetDuration:
+    @pytest.fixture()
+    def duration_dataset(self) -> Generator[ROMultiRowDataset, None, None]:
+        columns = {name: [0] * 8 for name in PreservedIndexColumnsKeys}
+        # Large epoch timestamps retain subsecond precision after subtraction.
+        epoch_ns = 1_700_000_000_000_000_000
+        timestamps = [
+            epoch_ns + seconds * 1_000_000_000
+            for seconds in [0, 1, 2, 3, 100, 102, 104, 106]
+        ]
+        columns.update(
+            index=list(range(8)),
+            episode_index=[7] * 4 + [42] * 4,
+            frame_index=list(range(4)) * 2,
+            timestamp_min=timestamps,
+            timestamp_max=[ts + 250_000_000 for ts in timestamps],
+            data=list(range(8)),
+        )
+        engine = create_engine("sqlite:///:memory:")
+        try:
+            yield ROMultiRowDataset.from_dataset(
+                RODataset.from_dataset(
+                    hg_datasets.Dataset.from_dict(columns), engine
+                ),
+                EpisodeChunkSamplerConfig(
+                    target_columns=["data"], hist_steps=2, pred_steps=2
+                ),
+            )
+        finally:
+            engine.dispose()
+
+    def test_duration_hours(self, duration_dataset: ROMultiRowDataset):
+        duration_dataset.set_transform(
+            lambda _: pytest.fail("Duration must not load transformed samples")
+        )
+        assert duration_dataset.get_duration_hours() == pytest.approx(
+            9.5 / 3600
+        )
+        assert len(duration_dataset) == 8
+
+    def test_filtered_anchors(self, duration_dataset: ROMultiRowDataset):
+        duration_dataset.row_sampler = EpisodeChunkSamplerConfig(
+            target_columns=["data"],
+            hist_steps=2,
+            pred_steps=2,
+            drop_incomplete_chunks=True,
+        )()
+        assert len(duration_dataset) == 4
+        assert len(duration_dataset.frame_dataset) == 8
+        assert duration_dataset.get_duration_hours() == pytest.approx(
+            3.5 / 3600
+        )
+
+        duration_dataset.row_sampler = DeltaTimestampSamplerConfig(
+            column_delta_ts={}
+        )()
+        assert duration_dataset.get_duration_hours() == pytest.approx(
+            9.5 / 3600
+        )
+
+    @pytest.mark.parametrize("drop", [False, True])
+    @pytest.mark.parametrize(
+        "indices, unfiltered_seconds, filtered_seconds",
+        [
+            ([2, 0, 1, 2], 2.25, 1.5),
+            ([3, 0, 3], 3.25, 0.5),
+            ([1], 0.25, 0.25),
+            ([], 0.0, 0.0),
+        ],
+    )
+    def test_selected_anchors(
+        self,
+        duration_dataset: ROMultiRowDataset,
+        drop: bool,
+        indices: list[int],
+        unfiltered_seconds: float,
+        filtered_seconds: float,
+    ):
+        duration_dataset.row_sampler = EpisodeChunkSamplerConfig(
+            target_columns=["data"],
+            pred_steps=2,
+            drop_incomplete_chunks=drop,
+        )()
+        selected = duration_dataset.select(indices)
+        seconds = filtered_seconds if drop else unfiltered_seconds
+        assert selected.get_duration_hours() == pytest.approx(seconds / 3600)
+        assert selected.select([]).get_duration_hours() == 0.0
+
+    def test_all_anchors_filtered(self, duration_dataset: ROMultiRowDataset):
+        duration_dataset.row_sampler = EpisodeChunkSamplerConfig(
+            target_columns=["data"],
+            pred_steps=4,
+            drop_incomplete_chunks=True,
+        )()
+        assert len(duration_dataset.frame_dataset) == 8
+        assert duration_dataset.get_duration_hours() == 0.0
+
+    @pytest.mark.parametrize(
+        "column, value, message",
+        [
+            ("episode_index", None, "episode_index"),
+            ("timestamp_min", None, "timestamp_min"),
+            ("timestamp_max", None, "timestamp_max"),
+            ("timestamp_max", 0, "timestamp_min <= timestamp_max"),
+        ],
+    )
+    def test_invalid_retained_anchor(
+        self,
+        duration_dataset: ROMultiRowDataset,
+        column: str,
+        value: int | None,
+        message: str,
+    ):
+        columns = duration_dataset.index_dataset.to_dict()
+        columns[column][3] = value
+        duration_dataset.index_dataset = hg_datasets.Dataset.from_dict(columns)
+        with pytest.raises(ValueError, match=message):
+            duration_dataset.get_duration_hours()
+
+        assert duration_dataset.select([0, 1]).get_duration_hours() == (
+            pytest.approx(1.25 / 3600)
+        )
 
 
 class TestConcatRODataset:

@@ -295,3 +295,8 @@ class HcTjRODataset(TorchDataset):
 
     def __getitems__(self, indices):
         return self._concat.__getitems__(indices)
+
+    @property
+    def duration(self) -> float:
+        """Return the total duration of all episodes in seconds."""
+        return sum(dataset.get_duration_hours() for dataset in self._concat.datasets)

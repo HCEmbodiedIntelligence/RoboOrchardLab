@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import warnings
+from functools import lru_cache
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from typing import (
@@ -32,6 +33,7 @@ from typing import (
 )
 
 import fsspec
+import pyarrow.compute as pc
 import torch
 from datasets import (
     Dataset as HFDataset,
@@ -891,6 +893,9 @@ class ROMultiRowDataset(RODataset):
     frame_dataset and index_dataset retain all source rows. Returned metadata
     indices continue to identify the original source frames.
 
+    Use :meth:`get_duration_hours` to sum the episode timestamp spans of the
+    currently retained sample anchors without loading feature columns.
+
     Args:
         dataset_path (str): The path to the dataset directory.
         row_sampler (MultiRowSamplerConfig): The configuration for the
@@ -945,6 +950,57 @@ class ROMultiRowDataset(RODataset):
         if self._sample_indices is not None:
             return len(self._sample_indices)
         return super().__len__()
+
+    @lru_cache(maxsize=1)
+    def get_duration_hours(self) -> float:
+        """Return the total timestamp span of current samples in hours.
+
+        Only sample anchors retained by the sampler and :meth:`select` count.
+        For each episode, compute ``max(timestamp_max) - min(timestamp_min)``
+        over those anchors, then sum the spans. Gaps within an episode's
+        retained span are included; gaps between episodes are excluded.
+        Repeated anchors do not increase the duration, and history/future
+        chunk rows are not counted separately. No final frame period is added.
+
+        Reads only index columns without applying dataset transforms or
+        consulting episode metadata. Timestamps must be in nanoseconds.
+
+        Returns:
+            float: Total duration in hours, or 0.0 when no samples remain.
+
+        Raises:
+            ValueError: A retained anchor has a missing episode index or
+                timestamp, or its timestamp_min exceeds timestamp_max.
+        """
+        if len(self) == 0:
+            return 0.0
+
+        indices = self.index_dataset.select_columns(
+            ["episode_index", "timestamp_min", "timestamp_max"]
+        )
+        if self._sample_indices is not None:
+            indices = indices.select(self._sample_indices)
+        table = indices.with_format("arrow")[:]
+        if any(column.null_count for column in table.columns):
+            raise ValueError(
+                "Retained samples must have episode_index, timestamp_min "
+                "and timestamp_max defined."
+            )
+        if pc.any(
+            pc.greater(table["timestamp_min"], table["timestamp_max"])
+        ).as_py():
+            raise ValueError(
+                "Retained samples must have timestamp_min <= timestamp_max."
+            )
+
+        bounds = table.group_by("episode_index").aggregate(
+            [("timestamp_min", "min"), ("timestamp_max", "max")]
+        )
+        duration_ns = sum(
+            row["timestamp_max_max"] - row["timestamp_min_min"]
+            for row in bounds.to_pylist()
+        )
+        return duration_ns / 1e9 / 3600
 
     def select(
         self,
