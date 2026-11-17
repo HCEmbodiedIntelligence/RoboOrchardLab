@@ -83,14 +83,21 @@ class DistributedBatchFlagSampler(Sampler[list[int]]):
             dataset_sample_weights = [
                 x / sum_weights for x in dataset_sample_weights
             ]
-            log_info = "\ndataset sample weights: "
-            for i, dataset in enumerate(self.data_source.datasets):
-                log_info += (
-                    f"\n|-{getattr(dataset, 'dataset_name', 'unnamed'):->30}"
-                    f": {dataset_sample_weights[i] * 100:.2f}%"
-                    f" [{len(dataset) / len(flags) * 100:.2f}%]"
-                )
-            logger.info(log_info)
+        log_info = "\ndataset sample weights: "
+        for i, dataset in enumerate(self.data_source.datasets):
+            data_ratio = len(dataset) / len(flags) if len(flags) else 0.0
+            # Without explicit weights, each sample is visited once per epoch.
+            sample_weight = (
+                data_ratio
+                if dataset_sample_weights is None
+                else dataset_sample_weights[i]
+            )
+            log_info += (
+                f"\n|-{getattr(dataset, 'dataset_name', 'unnamed'):->30}"
+                f": {sample_weight * 100:.2f}%"
+                f" [{data_ratio * 100:.2f}%]"
+            )
+        logger.info(log_info)
         self.dataset_sample_weights = dataset_sample_weights
         self.reset()
 

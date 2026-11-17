@@ -52,6 +52,7 @@ config.update(
     warmup_steps=300,
     decay_steps=int(1e5),
     decay_lr=2.5e-6,
+    # dataset_sample_weights=[5,1]
 )
 config["async_inference_plugin"]={
         "type": (

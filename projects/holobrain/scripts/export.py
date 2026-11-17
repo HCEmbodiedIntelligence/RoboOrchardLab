@@ -53,7 +53,9 @@ CONFIGS_DIR = PROJECT_ROOT / "configs"
 
 
 def main(args):
+    """Export processors, their URDF files, and the model to the workspace."""
     os.makedirs(args.workspace, exist_ok=True)
+    urdf_dir = os.path.join(os.path.abspath(args.workspace), "urdf")
 
     # shutil.copytree(
     #     CONFIGS_DIR,
@@ -88,7 +90,7 @@ def main(args):
         processors = build_processors(config)
     for dataset_name, processor in processors.items():
         processor_name = f"{dataset_name}_processor.json"
-        processor.save(args.workspace, processor_name)
+        processor.save(args.workspace, processor_name, urdf_dir=urdf_dir)
         logger.info(f"Export {processor_name} successfully.")
         _processor = HoloBrainProcessor.load(args.workspace, processor_name)
         logger.info(f"Reload {processor_name} successfully.")

@@ -38,12 +38,6 @@ _URDF_PATH = (
     / "urdf"
     / "hc_tj_robot.urdf"
 )
-_DATASET_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "data"
-    / "arrow_dataset"
-    / "hc_tj_261026"
-)
 _ARM_ONLY_DATASET_PATH = (
     Path(__file__).resolve().parents[1] / "data" / "arrow_dataset" / "hc_tj"
 )
@@ -117,7 +111,9 @@ def _base_to_zhi_from_zero_pose(urdf: Path) -> list[list[float]]:
 
 dataset_config = {
     "hc_tj": {
-        "data_paths": [str(_DATASET_PATH)],
+        "data_paths": [
+            "/data/workspaces/RoboOrchardLab/projects/holobrain/data/arrow_dataset/grasp_red_snack"
+        ],
         "urdf": str(_URDF_PATH),
         "cam_names": ["head"],
         "joint_names": tuple(
@@ -178,6 +174,20 @@ dataset_config = {
         "finger_keys": [[], []],
         "has_grippers": False,
         "joint_scale_shift": _arm_joint_scale_shift_from_urdf(_URDF_PATH),
+        "T_base2world": _base_to_zhi_from_zero_pose(_URDF_PATH),
+    },
+    "dev_test": {
+        "data_paths": [
+            "/data/workspaces/RoboOrchardLab/projects/holobrain/data/arrow_dataset/grasp_red_snack",
+        ],
+        "urdf": str(_URDF_PATH),
+        "cam_names": ["head"],
+        "joint_names": tuple(
+            _ARM_JOINT_NAMES[:7] + ["R_ban"] + _ARM_JOINT_NAMES[7:] + ["L_ban"]
+        ),
+        "finger_keys": [["R_ban_Link"], ["L_ban_Link"]],
+        "has_grippers": True,
+        "joint_scale_shift": _joint_scale_shift_from_urdf(_URDF_PATH),
         "T_base2world": _base_to_zhi_from_zero_pose(_URDF_PATH),
     },
 }
@@ -466,6 +476,13 @@ def build_datasets(config, dataset_names, mode, **kwargs):
             uuid.uuid5(uuid.NAMESPACE_DNS, dataset_name).hex[:4], 16
         )
         datasets.append(dataset)
+
+    for dataset in datasets:
+        logging.info(
+            f"\033[32m Loaded {dataset_name} with {len(dataset)} samples, \033[0m"
+            f"\033[32m {dataset.num_episode} episodes, \033[0m"
+            f"\033[32m dataset duration {dataset.duration:.2f} hours\033[0m"
+        )
     return datasets
 
 
