@@ -46,6 +46,11 @@ class CachedIndexDataset:
     def __len__(self) -> int:
         return len(self._dataset)
 
+    @property
+    def source_dataset(self) -> HFDataset:
+        """Return the packed index dataset backing the row cache."""
+        return self._dataset
+
     def _cache_chunk(self, index: int) -> None:
         """Cache a chunk of the dataset at the given index."""
         min_idx = max(0, index - 100)

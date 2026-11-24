@@ -17,6 +17,7 @@
 """RODataset reader for 14-axis and 16-axis hc_tj dual-arm embodiments."""
 
 from __future__ import annotations
+from functools import cached_property
 from typing import Callable, Sequence
 
 import cv2
@@ -26,6 +27,7 @@ from torchvision.transforms import Compose
 
 from robo_orchard_lab.dataset.horizon_manipulation.row_sampler import (
     EpisodeChunkSamplerConfig,
+    ProcessEpisodeChunkSamplerConfig,
 )
 from robo_orchard_lab.dataset.robot.dataset import (
     ConcatRODataset,
@@ -185,6 +187,9 @@ class HcTjRODataset(TorchDataset):
         joint_names: Ordered joint names expected in the ``joints`` and
             ``actions`` columns. Defaults to the 16-axis arm-and-gripper
             layout.
+        pred_interval_dict: Exclusive episode-progress bounds mapped to
+            future strides. A dictionary selects ProcessEpisodeChunkSampler.
+            The default None uses EpisodeChunkSampler with stride 1.
     """
 
     def __init__(
@@ -196,19 +201,26 @@ class HcTjRODataset(TorchDataset):
         transforms: list[Callable] | None = None,
         joint_names: Sequence[str] = _DEFAULT_JOINT_NAMES,
         drop_incomplete_chunks: bool = False,
+        pred_interval_dict: dict[float, int] | None = None,
     ) -> None:
         if not paths:
             raise ValueError("hc_tj dataset paths must not be empty")
         joint_names = tuple(joint_names)
         if not joint_names or len(set(joint_names)) != len(joint_names):
             raise ValueError("hc_tj joint_names must be non-empty and unique")
-        row_sampler = EpisodeChunkSamplerConfig(
+        sampler_kwargs = dict(
             target_columns=["joints", "actions"],
             hist_steps=hist_steps,
             pred_steps=pred_steps,
             drop_incomplete_chunks=drop_incomplete_chunks,
         )
-        self._dropped_tail_steps = pred_steps if drop_incomplete_chunks else 0
+        row_sampler: EpisodeChunkSamplerConfig
+        if pred_interval_dict is None:
+            row_sampler = EpisodeChunkSamplerConfig(**sampler_kwargs)
+        else:
+            row_sampler = ProcessEpisodeChunkSamplerConfig(
+                pred_interval_dict=pred_interval_dict, **sampler_kwargs
+            )
         datasets = [
             ROMultiRowDataset(
                 dataset_path=path,
@@ -238,18 +250,30 @@ class HcTjRODataset(TorchDataset):
 
     def get_episode_range(self, episode_index: int) -> tuple[int, int]:
         """Return the concatenated half-open sample range for one episode."""
-        global_episode = 0
+        if not 0 <= episode_index < len(self._episode_ranges):
+            raise KeyError(f"Episode index {episode_index} not found")
+        return self._episode_ranges[episode_index]
+
+    @cached_property
+    def _episode_ranges(self) -> list[tuple[int, int]]:
+        """Build sample ranges from the retained anchors without decoding."""
+        ranges = []
         frame_offset = 0
         for dataset in self._concat.datasets:
+            assert isinstance(dataset, ROMultiRowDataset)
+            episode_rows = dataset.sample_index_dataset.select_columns(
+                ["episode_index"]
+            )
+            episode_ids = episode_rows.with_format("arrow")[:]["episode_index"]
+            counts = {
+                row["values"]: row["counts"]
+                for row in episode_ids.value_counts().to_pylist()
+            }
             for episode in dataset.iterate_meta(Episode):
-                sample_count = max(
-                    0, episode.frame_num - self._dropped_tail_steps
-                )
-                if global_episode == episode_index:
-                    return frame_offset, frame_offset + sample_count
-                global_episode += 1
-                frame_offset += sample_count
-        raise KeyError(f"Episode index {episode_index} not found")
+                stop = frame_offset + counts.get(episode.index, 0)
+                ranges.append((frame_offset, stop))
+                frame_offset = stop
+        return ranges
 
     def __len__(self) -> int:
         return len(self._concat)

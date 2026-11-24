@@ -397,6 +397,8 @@ def build_datasets(config, dataset_names, mode, **kwargs):
 
     Set config["drop_incomplete_chunks"] to True to exclude sample anchors
     without a full future chunk. By default, episode tails are padded.
+    Set config["pred_interval_dict"] to map exclusive episode-progress
+    bounds to future strides, for example {0.1: 3, 0.3: 2}.
     """
     from robo_orchard_lab.dataset.hc_tj import HcTjRODataset
     from robo_orchard_lab.utils.build import build
@@ -433,6 +435,7 @@ def build_datasets(config, dataset_names, mode, **kwargs):
             hist_steps=config["hist_steps"],
             pred_steps=config["pred_steps"],
             drop_incomplete_chunks=config.get("drop_incomplete_chunks", False),
+            pred_interval_dict=config.get("pred_interval_dict"),
             joint_names=data_config["joint_names"],
             transforms=[build(item) for item in as_sequence(transforms)],
         )
