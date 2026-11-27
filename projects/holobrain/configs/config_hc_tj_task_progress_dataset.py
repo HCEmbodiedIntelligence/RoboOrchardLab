@@ -113,6 +113,8 @@ dataset_config = {
         "joint_scale_shift": _joint_scale_shift_from_urdf(_URDF_PATH),
         "T_base2world": _base_to_zhi_from_zero_pose(_URDF_PATH),
         "count_taskprogress": True,
+        "pred_interval_dict": {0.5: 3, 0.85: 1,1.0: 2},
+        "task_progress_loss_weight":0.2
     },
 }
 
@@ -216,7 +218,7 @@ def build_transforms(config, mode, data_config):
             fk_loss_weight=loss_weights.tolist(),
         )
         add_items.update(
-            task_progress_loss_weight=config.get("task_progress_loss_weight", 1.0)
+            task_progress_loss_weight=config.get("task_progress_loss_weight", 0.2)
         )
 
     state_sampling = {
@@ -359,6 +361,8 @@ def build_datasets(config, dataset_names, mode, **kwargs):
 
     Set config["drop_incomplete_chunks"] to True to exclude sample anchors
     without a full future chunk. By default, episode tails are padded.
+    Set config["pred_interval_dict"] to map episode-progress bounds to
+    future strides. The task progress target still uses the source frame.
     """
     from robo_orchard_lab.dataset.hc_tj import HcTjRODataset
     from robo_orchard_lab.utils.build import build
@@ -396,6 +400,7 @@ def build_datasets(config, dataset_names, mode, **kwargs):
             hist_steps=config["hist_steps"],
             pred_steps=config["pred_steps"],
             drop_incomplete_chunks=config.get("drop_incomplete_chunks", False),
+            pred_interval_dict=config.get("pred_interval_dict"),
             joint_names=data_config["joint_names"],
             transforms=[build(item) for item in as_sequence(transforms)],
         )
