@@ -7,6 +7,8 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 用法: start_hc_tj_ros_local.sh ['任务指令']
 启动本机 HoloBrain 推理服务和 ROS 2 直连客户端。
 观测直接订阅 /observation/*；动作通过 HC 中间件程序控制入口下发。
+启动前检查与机器人有线 NTP 时钟的同步，失败则不启动控制。
+HC_TJ_NTP_SERVER 可指定机器人有线 IPv4 地址，默认 192.168.2.33。
 EOF
   exit 0
 fi
@@ -25,7 +27,7 @@ source /opt/ros/humble/setup.bash
 set -u
 
 PYTHON="${HC_TJ_PYTHON:-/home/hc-em-lap/miniforge3/envs/holobrain/bin/python}"
-MODEL_DIR="${HC_TJ_MODEL_DIR:-/home/hc-em-lap/workspace/weights/holobrain/261027_export/model}"
+MODEL_DIR="${HC_TJ_MODEL_DIR:-/home/hc-em-lap/workspace/weights/holobrain/261125_export/model/}"
 URDF_PATH="${HC_TJ_URDF_PATH:-${REPOSITORY_ROOT}/projects/holobrain/assets/hc_tj_robot.urdf}"
 INFERENCE_PORT="${HC_TJ_INFERENCE_PORT:-2000}"
 INSTRUCTION="${*:-${HC_TJ_INSTRUCTION:-grasp red snack}}"
@@ -83,6 +85,9 @@ chmod 600 "${TOKEN_FILE}"
 mkdir -p -- "${RUNTIME_DIR}"
 echo "[local-launcher] ROS_DOMAIN_ID=${ROS_DOMAIN_ID} DDS=${FASTRTPS_DEFAULT_PROFILES_FILE}"
 echo "[local-launcher] 直接订阅 /observation/cameras/head/*、关节和手部反馈。"
+echo "[local-launcher] 检查机器人有线时钟：连续 2 秒偏差不超过 10 ms。"
+"${PYTHON}" "${SCRIPT_DIR}/hc_tj_clock_check.py" \
+  --server "${HC_TJ_NTP_SERVER:-192.168.2.33}"
 echo "[local-launcher] 启动 GPU 推理服务，日志: ${INFERENCE_LOG}"
 "${PYTHON}" "${SCRIPT_DIR}/inference_server.py" \
   --model_dir "${MODEL_DIR}" \
@@ -110,6 +115,10 @@ while ! curl --noproxy '*' -s --max-time 1 -o /dev/null "http://127.0.0.1:${INFE
   sleep 1
 done
 
+# Model loading may take minutes; do not reuse an earlier clock qualification.
+echo "[local-launcher] 模型加载完成，再次确认机器人时钟同步。"
+"${PYTHON}" "${SCRIPT_DIR}/hc_tj_clock_check.py" \
+  --server "${HC_TJ_NTP_SERVER:-192.168.2.33}"
 echo "[local-launcher] 推理服务已就绪，启动 ROS 2 直连客户端。按 Ctrl+C 全部停止。"
 echo "[local-launcher] 模型持续推理；动作下发仍需 HC Dashboard 开启程序控制。"
 echo "[local-launcher] 客户端频率、限速与抢占日志: ${CLIENT_LOG}"
@@ -131,7 +140,7 @@ echo "[local-launcher] 客户端频率、限速与抢占日志: ${CLIENT_LOG}"
   --joint-command-topic /hc_teleop/joint_cmd \
   --right-hand-topic /hc_teleop/joint_cmd_finger_right \
   --left-hand-topic /hc_teleop/joint_cmd_finger_left \
-  --first-point-jump-rad "${HC_TJ_FIRST_POINT_JUMP_RAD:-0.60}" \
+  --first-point-jump-rad "${HC_TJ_FIRST_POINT_JUMP_RAD:-2.0}" \
   --state-timeout-s "${HC_TJ_STATE_TIMEOUT_S:-0.6}" \
   --enable-dagger \
   --enable-control 2>&1 | tee "${CLIENT_LOG}"

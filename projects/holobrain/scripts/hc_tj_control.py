@@ -83,6 +83,8 @@ class RobotControlGate:
         self._identity: tuple[str, str, int] | None = None
         self._retired_instances: set[str] = set()
         self._ownership: dict[str, Any] = {}
+        self._timing: dict[str, Any] = {}
+        self._timing_rejections = 0
 
     def _close(self, reason: str) -> None:
         if self._allowed:
@@ -134,7 +136,16 @@ class RobotControlGate:
             before = self._window
             self._expire()
             age = (now_ns - stamp) * 1e-9
+            self._timing = {
+                "source_age_ms": round(age * 1000, 3),
+                "source_stamp_ns": stamp,
+                "client_now_ns": now_ns,
+                "max_future_ms": 50,
+                "max_age_ms": self.timeout_s * 1000,
+                "valid": -0.05 <= age <= self.timeout_s,
+            }
             if not -0.05 <= age <= self.timeout_s:
+                self._timing_rejections += 1
                 return before != self._window
             if instance in self._retired_instances:
                 return before != self._window
@@ -206,6 +217,8 @@ class RobotControlGate:
                 "allowed": self._allowed,
                 "reason": self._reason,
                 "ownership": dict(self._ownership),
+                "timing": dict(self._timing),
+                "timing_rejections": self._timing_rejections,
             }
 
 

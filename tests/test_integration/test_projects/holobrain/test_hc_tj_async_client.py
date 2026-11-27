@@ -478,6 +478,164 @@ def feedback(node, ros, names=CONTROL_JOINT_NAMES):
 
 
 class TestFeedbackRecovery:
+    def test_legacy_dagger_tracks_at_the_middleware_speed(
+        self, config, ros, monkeypatch
+    ):
+        clock = [100.0]
+        monkeypatch.setattr(client.time, "monotonic", lambda: clock[0])
+        node = ros.create(
+            config(
+                enable_control=True,
+                enable_dagger=True,
+                control_token="x" * 16,
+                max_arm_velocity_rad_s=2.0,
+                first_point_jump_rad=1.0,
+            )
+        )
+        q = np.asarray(client.DEFAULT_JOINT_POSITIONS)
+        measured = q.copy()
+        output = node.publishers[node.config.joint_command_topic].messages
+        action = np.r_[q[:7], 0, q[7:14], 0]
+        for tick in range(180):
+            clock[0] = 100.0 + tick * 0.01
+            node.now_ns += 10_000_000
+            send_state(node, ros)
+            if tick >= 14:
+                desired = output[tick - 14].position[3]
+                measured[3] += np.clip(
+                    desired - measured[3], -0.01, 0.01
+                )
+            state = ros.Message()
+            state.name = list(CONTROL_JOINT_NAMES)
+            state.position = measured.tolist()
+            state.header.stamp = node.get_clock().now().to_msg()
+            node._on_joints(state)
+            if tick % 20 == 0:
+                action[3] = measured[3] + 0.85
+                chunk = np.tile(action, (64, 1))
+                node._future = Future()
+                node._future_window = node._control_window
+                node._future_started = clock[0] - 0.01
+                node._future_observed_s = clock[0] - 0.02
+                node._future.set_result((chunk, 0.01))
+                node._inference_tick()
+            node._control_tick()
+
+        positions = np.asarray([message.position[3] for message in output])
+        velocities = np.diff(positions) / 0.01
+        assert len(output) == 180
+        assert node._diagnostic_counts["limiter_resets"] == 1
+        assert node._diagnostic_counts["chunks_accepted"] == 9
+        assert node._feedback_pause is None
+        assert np.min(velocities) >= 0.0
+        assert np.max(velocities) == pytest.approx(1.0)
+        assert np.max(np.abs(np.diff(velocities))) <= 0.010001
+        assert node._tracking_error_max_rad < 0.15
+
+    def test_tracking_limit_discards_old_trajectory_until_manual_rearm(
+        self, config, ros, monkeypatch
+    ):
+        clock = [100.0]
+        monkeypatch.setattr(client.time, "monotonic", lambda: clock[0])
+        node = ros.create(
+            config(
+                enable_control=True,
+                enable_dagger=True,
+                control_token="x" * 16,
+            )
+        )
+        q = np.asarray(client.DEFAULT_JOINT_POSITIONS)
+        safe = np.tile(np.r_[q[:7], 0, q[7:14], 0], (64, 1))
+        far = safe.copy()
+        far[:, 3] += 0.60
+        old = Future()
+        send_state(node, ros)
+        node._native_actions = far
+        node._received_action_chunk = True
+        node._native_started = clock[0]
+        node._future, node._future_window = old, node._control_window
+        node.limiter.reset(q[:14])
+        node.limiter.previous[3] += 0.2999
+        node.limiter.previous_velocity[3] = 0.25
+        feedback(node, ros)
+        node._control_tick()
+
+        assert "joint=Joint4_R" in node._feedback_pause
+        assert "limit_rad=0.300000" in node._feedback_pause
+        assert node._gate.snapshot()["reason"] == "target_tracking_error"
+        assert node._native_actions is None
+        assert node._future_window == ""
+        assert not node._received_action_chunk
+        assert not node._gate.snapshot()["allowed"]
+        assert all(not pub.messages for pub in node.publishers.values())
+        old.set_result((far, 0.01))
+
+        for _ in range(60):
+            clock[0] += 0.02
+            node.now_ns += 20_000_000
+            feedback(node, ros)
+            send_state(node, ros)
+            node._control_tick()
+        assert node._feedback_pause is not None
+        assert all(not pub.messages for pub in node.publishers.values())
+        for state, epoch in (("MANUAL", 2), ("AUTO", 3), ("AUTO", 3)):
+            node.now_ns += 1_000_000
+            send_state(node, ros, state, epoch)
+        assert node._feedback_pause is None
+        node._inference_tick()
+        assert node._native_actions is None
+        assert all(not pub.messages for pub in node.publishers.values())
+
+        clock[0] += 0.01
+        node.now_ns += 10_000_000
+        feedback(node, ros)
+        node._future = Future()
+        node._future_window = node._control_window
+        node._future_started = clock[0]
+        node._future_observed_s = clock[0]
+        safe[:, 3] += 0.05
+        node._future.set_result((safe, 0.01))
+        node._inference_tick()
+        node._control_tick()
+        messages = node.publishers[node.config.joint_command_topic].messages
+        assert len(messages) == 1
+        assert messages[0].position[3] == pytest.approx(q[3] + 0.0001)
+
+    @pytest.mark.parametrize("age_ns", [-80_000_000, 600_000_000])
+    def test_ownership_timing_violation_requires_manual_recovery(
+        self, config, ros, age_ns
+    ):
+        node = ros.create(
+            config(
+                enable_control=True,
+                enable_dagger=True,
+                control_token="x" * 16,
+            )
+        )
+        send_state(node, ros)
+        feedback(node, ros)
+        node._native_actions = np.zeros((12, 16))
+        node._received_action_chunk = True
+        node.now_ns += 1_000_000
+        msg = ros.Message()
+        owner = node._gate.snapshot()["ownership"]
+        msg.data = json.dumps(
+            {
+                **owner,
+                "published_stamp_ns": node.now_ns - age_ns,
+            }
+        )
+        node._on_ownership(msg)
+        assert node.fault is None
+        assert "ownership timestamp" in node._feedback_pause
+        assert node._native_actions is None
+        node.now_ns += 1_000_000
+        send_state(node, ros)
+        node._control_tick()
+        node._inference_tick()
+        assert not node._gate.snapshot()["allowed"]
+        assert all(not pub.messages for pub in node.publishers.values())
+
     def test_delivery_stall_stops_both_paths(self, config, ros, monkeypatch):
         clock = [100.0]
         monkeypatch.setattr(client.time, "monotonic", lambda: clock[0])

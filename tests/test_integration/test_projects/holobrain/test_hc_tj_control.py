@@ -56,6 +56,20 @@ class RobotControlGateTest(unittest.TestCase):
         self.gate.update_ownership(ownership(), 1_000_000_000)
         self.assertTrue(self.gate.snapshot()["allowed"])
 
+    def test_clock_diagnostics_preserve_both_timestamps(self):
+        self.gate.update_ownership(ownership(), 920_000_000)
+        state = self.gate.snapshot()
+        self.assertFalse(state["allowed"])
+        self.assertEqual(state["timing"]["source_age_ms"], -80)
+        self.assertEqual(state["timing"]["source_stamp_ns"], 1_000_000_000)
+        self.assertEqual(state["timing"]["client_now_ns"], 920_000_000)
+        self.assertFalse(state["timing"]["valid"])
+        self.assertEqual(state["timing_rejections"], 1)
+        self.gate.update_ownership(ownership(), 1_002_000_000)
+        state = self.gate.snapshot()
+        self.assertTrue(state["timing"]["valid"])
+        self.assertEqual(state["timing_rejections"], 1)
+
     def test_pause_release_and_new_auto_never_reuse_window(self):
         gate = self.gate
         gate.update_ownership(ownership(), 1_000_000_000)

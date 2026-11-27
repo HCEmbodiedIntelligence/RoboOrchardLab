@@ -104,6 +104,9 @@ DEFAULT_JOINT_POSITIONS = (
 )
 _RESET_POSITION_TOLERANCE_RAD = 0.02
 _MAX_CONSECUTIVE_DAGGER_JUMPS = 3
+# Match the X1 middleware's legacy program-control envelope.
+_LEGACY_DAGGER_ARM_VELOCITY_RAD_S = 3.0
+_LEGACY_DAGGER_TRACKING_LIMIT_RAD = 0.30
 
 
 class RobotInterface(str, Enum):
@@ -119,6 +122,7 @@ class HcTjAsyncClientConfig:
 
     Legacy hands use command-derived estimates, including with DAgger;
     measured hand feedback is required only by the Motion backend.
+    Legacy DAgger arm output is capped to the X1 program-control velocity.
     """
 
     server_url: str
@@ -139,11 +143,11 @@ class HcTjAsyncClientConfig:
     request_timeout_s: float = 30.0
     camera_timeout_s: float = 1.0
     state_timeout_s: float = 0.25
-    max_arm_velocity_rad_s: float = 0.25
-    max_arm_acceleration_rad_s2: float = 1.0
+    max_arm_velocity_rad_s: float = 10
+    max_arm_acceleration_rad_s2: float = 10
     """Command acceleration bound retained across chunks, in rad/s²."""
     first_point_jump_rad: float = 0.30
-    latency_ewma_alpha: float = 0.25
+    latency_ewma_alpha: float = 0.9
     color_topic: str = "/observation/cameras/head/color/compressed"
     depth_topic: str = "/observation/cameras/head/depth/compressed"
     calibration_topic: str = "/observation/cameras/head/calibration"
@@ -189,8 +193,11 @@ class HcTjAsyncClientConfig:
             )
         if self.camera_timeout_s <= 0 or self.state_timeout_s <= 0:
             raise ValueError("camera and state timeouts must be positive")
-        if self.max_arm_velocity_rad_s <= 0:
-            raise ValueError("arm velocity must be positive")
+        if (
+            not math.isfinite(self.max_arm_velocity_rad_s)
+            or self.max_arm_velocity_rad_s <= 0
+        ):
+            raise ValueError("arm velocity must be finite and positive")
         if (
             not math.isfinite(self.max_arm_acceleration_rad_s2)
             or self.max_arm_acceleration_rad_s2 <= 0
@@ -483,10 +490,19 @@ def _ros_node_class():
             self.config = config
             self.observations = ObservationBuffer()
             lower, upper = load_arm_joint_limits(config.urdf_path)
+            self._check_legacy_dagger_tracking = (
+                config.enable_dagger
+                and config.robot_interface is RobotInterface.LEGACY
+            )
+            arm_velocity = config.max_arm_velocity_rad_s
+            if self._check_legacy_dagger_tracking:
+                arm_velocity = min(
+                    arm_velocity, _LEGACY_DAGGER_ARM_VELOCITY_RAD_S
+                )
             self.limiter = ArmCommandLimiter(
                 lower,
                 upper,
-                config.max_arm_velocity_rad_s,
+                arm_velocity,
                 max_acceleration_rad_s2=config.max_arm_acceleration_rad_s2,
             )
             self._default_joint_positions = np.asarray(
@@ -545,6 +561,7 @@ def _ros_node_class():
             self._last_publish_time = None
             self._gripper_targets: dict[str, float] = {}
             self._publish_gap_max_ms = 0.0
+            self._tracking_error_max_rad = 0.0
             self._request_elapsed_ms = 0.0
             self._inference_wait = "startup"
             self._control_wait = "startup"
@@ -654,12 +671,17 @@ def _ros_node_class():
                 "[motion-limits] "
                 + json.dumps(
                     {
-                        "arm_velocity_rad_s": config.max_arm_velocity_rad_s,
+                        "arm_velocity_rad_s": arm_velocity,
+                        "configured_arm_velocity_rad_s": (
+                            config.max_arm_velocity_rad_s
+                        ),
+                        "tracking_limit_rad": _LEGACY_DAGGER_TRACKING_LIMIT_RAD
+                        if self._check_legacy_dagger_tracking
+                        else None,
                         "arm_acceleration_rad_s2": (
                             config.max_arm_acceleration_rad_s2
                         ),
-                        "step_rad": config.max_arm_velocity_rad_s
-                        / config.control_hz,
+                        "step_rad": arm_velocity / config.control_hz,
                         "first_point_jump_rad": config.first_point_jump_rad,
                         "control_hz": config.control_hz,
                         "inference_hz": config.inference_hz,
@@ -742,8 +764,15 @@ def _ros_node_class():
                         if self._native_actions is not None
                         else 0,
                         "max_clip_rad": self.limiter.max_clip_rad,
+                        "tracking_error_max_rad": round(
+                            self._tracking_error_max_rad, 6
+                        ),
                         "allowed": state.get("allowed"),
                         "gate_reason": state.get("reason"),
+                        "ownership_timing": state.get("timing"),
+                        "ownership_timing_rejections": state.get(
+                            "timing_rejections"
+                        ),
                         "ownership": state.get("ownership"),
                     }
                 )
@@ -751,6 +780,7 @@ def _ros_node_class():
             self._diagnostic_previous = counts
             self._diagnostic_time = now
             self._publish_gap_max_ms = 0.0
+            self._tracking_error_max_rad = 0.0
             self.limiter.max_clip_rad = 0.0
 
         @property
@@ -875,6 +905,22 @@ def _ros_node_class():
                         data,
                         self.get_clock().now().nanoseconds,
                     )
+                    timing = self._gate.snapshot().get("timing", {})
+                    if (
+                        self.config.enable_control
+                        and self.config.enable_dagger
+                        and self._auto_grant is not None
+                        and self._feedback_pause is None
+                        and timing.get("valid") is False
+                    ):
+                        # After any AUTO grant, a clock/transport violation
+                        # must not silently reopen on the next heartbeat.
+                        self._pause_feedback(
+                            _FeedbackTimingError(
+                                "ownership timestamp outside safety bounds: "
+                                + json.dumps(timing)
+                            )
+                        )
                     if self._feedback_pause is not None:
                         self._poll_feedback_recovery()
                         state = self._gate.snapshot()
@@ -1100,8 +1146,10 @@ def _ros_node_class():
                         + detail
                     )
 
-        def _pause_feedback(self, error: _FeedbackTimingError) -> None:
-            """Stop DAgger without weakening permanent non-timing faults."""
+        def _pause_feedback(
+            self, error: ValueError, *, reason: str = "feedback_timing"
+        ) -> None:
+            """Stop output and rearm only after stable feedback and manual control."""
             if not self.config.enable_dagger:
                 self._latch_fault(f"control safety failure: {error}")
                 return
@@ -1110,7 +1158,7 @@ def _ros_node_class():
                 self._feedback_stable_since = None
                 self._feedback_last_good = None
                 self._feedback_manual_grant = None
-                self._gate.invalidate("feedback_timing")
+                self._gate.invalidate(reason)
                 self._sync_control()
                 self._clear_trajectory()
                 # Keep the worker bounded, but make even an already-completed
@@ -1543,6 +1591,28 @@ def _ros_node_class():
                 ):
                     self._sync_control()
                     return
+                if self._check_legacy_dagger_tracking:
+                    measured = feedback_sample.value[:14]
+                    error = np.abs(arm - measured)
+                    joint = int(np.argmax(error))
+                    deviation = float(error[joint])
+                    self._tracking_error_max_rad = max(
+                        self._tracking_error_max_rad, deviation
+                    )
+                    if deviation > _LEGACY_DAGGER_TRACKING_LIMIT_RAD:
+                        self._diagnostic_counts["tracking_limit_pauses"] += 1
+                        self._pause_feedback(
+                            ValueError(
+                                "arm command exceeds measured tracking limit: "
+                                f"joint={CONTROL_JOINT_NAMES[joint]} "
+                                f"target_rad={arm[joint]:.6f} "
+                                f"measured_rad={measured[joint]:.6f} "
+                                f"error_rad={deviation:.6f} "
+                                f"limit_rad={_LEGACY_DAGGER_TRACKING_LIMIT_RAD:.6f}"
+                            ),
+                            reason="target_tracking_error",
+                        )
+                        return
                 if self._motion is not None:
                     for topic, names, positions in self._motion.commands(arm):
                         message = JointState()
