@@ -71,3 +71,15 @@ legacy 客户端通过 `/hc_teleop/joint_cmd_finger_right` 和对应的左手话
 双手的 `R_ban`、`L_ban` 可在 `/action/joint_states` 中按名字查看。若 MCAP
 要求在同一条右手消息中保存两个开合标签，应在录制器按时间戳合并左右手标签，
 只修改写入 MCAP 的消息副本。
+
+## UDP 缓冲调优
+
+图像与关节反馈同走 DDS/UDP。内核默认 UDP 缓冲约 208 KB，会在 30 Hz 深度与彩色图像下溢出，
+引发 `/observation/joint_states` 重传卡顿并触发“状态超时”。
+
+- 推理机：安装 `projects/holobrain/scripts/99-ros2-udp.conf` 到 `/etc/sysctl.d/` 并执行
+  `sudo sysctl --system`。
+- `fastdds_inference_profile.xml` 已为 UDP 传输配置 16 MB 收发缓冲，`interfaceWhiteList`
+  需写推理机的有线地址（当前 `192.168.2.100`）。
+- 机器人侧 `/home/niic/shm_profile.xml` 必须包含
+  `<useBuiltinTransports>false</useBuiltinTransports>` 与同样的 16 MB 缓冲。
