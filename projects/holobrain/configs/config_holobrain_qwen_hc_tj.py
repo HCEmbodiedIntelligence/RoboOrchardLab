@@ -43,6 +43,7 @@ config = copy.deepcopy(_common_config)
 config.update(
     training_datasets=["dev_test"],
     deploy_datasets=["dev_test"],
+    pred_interval_dict=None,  # Set to {0.1: 3, 0.3: 2} for progress sampling.
     batch_size=1,
     step_log_freq=50,
     save_step_freq=5000,

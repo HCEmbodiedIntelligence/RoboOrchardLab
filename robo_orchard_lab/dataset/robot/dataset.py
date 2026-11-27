@@ -951,6 +951,13 @@ class ROMultiRowDataset(RODataset):
             return len(self._sample_indices)
         return super().__len__()
 
+    @property
+    def sample_index_dataset(self) -> HFDataset:
+        """Return index rows for retained sample anchors in sample order."""
+        if self._sample_indices is None:
+            return self.index_dataset
+        return self.index_dataset.select(self._sample_indices)
+
     @lru_cache(maxsize=1)
     def get_duration_hours(self) -> float:
         """Return the total timestamp span of current samples in hours.

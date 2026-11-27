@@ -14,11 +14,16 @@
 # implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
+from bisect import bisect_right
+from typing import Annotated, Literal
+
 import numpy as np
 from datasets import Dataset as HFDataset
+from pydantic import Field
 from robo_orchard_core.utils.config import ClassType
 
 from robo_orchard_lab.dataset.robot.row_sampler import (
+    CachedIndexDataset,
     MultiRowSampler,
     MultiRowSamplerConfig,
 )
@@ -26,6 +31,8 @@ from robo_orchard_lab.dataset.robot.row_sampler import (
 __all__ = [
     "EpisodeChunkSampler",
     "EpisodeChunkSamplerConfig",
+    "ProcessEpisodeChunkSampler",
+    "ProcessEpisodeChunkSamplerConfig",
 ]
 
 
@@ -153,4 +160,115 @@ class EpisodeChunkSamplerConfig(MultiRowSamplerConfig[EpisodeChunkSampler]):
 
     True excludes these sample anchors in ROMultiRowDataset, retaining source
     frames for other chunks. History padding is unchanged.
+    """
+
+
+class ProcessEpisodeChunkSampler(EpisodeChunkSampler):
+    """Sample a fixed-size chunk with a stride based on its anchor's progress.
+
+    History is contiguous and includes the anchor. Every future step uses
+    the stride selected for that anchor. Episodes occupy contiguous packed
+    rows, and progress is the zero-based row offset divided by episode length.
+    """
+
+    def __init__(self, cfg: "ProcessEpisodeChunkSamplerConfig") -> None:
+        super().__init__(cfg)
+        schedule = sorted((cfg.pred_interval_dict or {}).items())
+        self._thresholds = tuple(threshold for threshold, _ in schedule)
+        self._strides = (*(stride for _, stride in schedule), 1)
+        self._episode_bounds_cache: tuple[HFDataset, list[int]] | None = None
+
+    def get_sample_indices(self, index_dataset: HFDataset) -> list[int] | None:
+        """Return anchors with complete future chunks, or None for padding."""
+        # NOTE: 这一步直接将超出的anchor过滤掉了，导致后续sample_row_idx中无法获取到超出的anchor的索引
+        bounds = self._episode_bounds(index_dataset)
+        if not self.cfg.drop_incomplete_chunks:
+            return None
+        return [
+            index
+            for start, stop in zip(bounds[:-1], bounds[1:], strict=True)
+            for index in range(start, stop - self.pred_steps)
+            if index + self.pred_steps * self._stride(index, start, stop)
+            < stop
+        ]
+
+    def sample_row_idx(
+        self,
+        index_dataset: HFDataset | CachedIndexDataset,
+        index: int,
+    ) -> dict[str, list[int | None]]:
+        """Return source indices for each target column in chunk order.
+
+        Pad missing history with the first episode row. Pad missing future
+        steps with the last episode row when dropping is disabled.
+
+        Raises:
+            IndexError: The anchor is outside the dataset.
+            ValueError: Dropping is enabled and the anchor is incomplete.
+        """
+        if isinstance(index_dataset, CachedIndexDataset):
+            index_dataset = index_dataset.source_dataset
+        if index < 0:
+            index += len(index_dataset)
+        if not 0 <= index < len(index_dataset):
+            raise IndexError(f"Anchor row {index} is outside the dataset.")
+
+        bounds = self._episode_bounds(index_dataset)
+        episode = bisect_right(bounds, index) - 1
+        start, stop = bounds[episode], bounds[episode + 1]
+        stride = self._stride(index, start, stop)
+        if self.cfg.drop_incomplete_chunks and (
+            index + self.pred_steps * stride >= stop
+        ):
+            raise ValueError(
+                f"Row {index} has an incomplete future chunk. "
+                "Use get_sample_indices() to select eligible anchors."
+            )
+
+        chunk: list[int | None] = [
+            max(start, row)
+            for row in range(index - self.hist_steps + 1, index + 1)
+        ]
+        chunk.extend(
+            min(index + step * stride, stop - 1)
+            for step in range(1, self.pred_steps + 1)
+        )
+        return {column: chunk for column in self.cfg.target_columns}
+
+    def _episode_bounds(self, index_dataset: HFDataset) -> list[int]:
+        """Cache run boundaries for the current source index dataset."""
+        cached = self._episode_bounds_cache
+        if cached is not None and cached[0] is index_dataset:
+            return cached[1]
+        episode_rows = index_dataset.select_columns(["episode_index"])
+        episodes = episode_rows.with_format("arrow")[:][
+            "episode_index"
+        ].to_numpy()
+        changes = np.flatnonzero(episodes[1:] != episodes[:-1]) + 1
+        bounds = [0, *changes.tolist(), len(episodes)]
+        self._episode_bounds_cache = (index_dataset, bounds)
+        return bounds
+
+    def _stride(self, index: int, start: int, stop: int) -> int:
+        progress = (index - start) / (stop - start)
+        return self._strides[bisect_right(self._thresholds, progress)]
+
+
+class ProcessEpisodeChunkSamplerConfig(EpisodeChunkSamplerConfig):
+    """Configure future chunk strides by exclusive episode-progress bounds."""
+
+    class_type: ClassType[ProcessEpisodeChunkSampler] = (
+        ProcessEpisodeChunkSampler
+    )
+    pred_interval_dict: (
+        dict[
+            Annotated[float, Field(gt=0, le=1)],
+            Annotated[int, Field(strict=True, ge=1)],
+        ]
+        | None
+    ) = None
+    """Map progress bounds in (0, 1] to positive strides in packed rows.
+
+    For example, {0.1: 3, 0.3: 2} uses stride 3 below 10%, stride 2 from
+    10% up to 30%, and stride 1 from 30% onward. None uses stride 1 throughout.
     """
